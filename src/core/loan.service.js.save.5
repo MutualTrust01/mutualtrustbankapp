@@ -1,0 +1,4711 @@
+const pool = require("../../db");
+const { v4: uuidv4 } = require("uuid");
+const { sendStyledMail } = require("../../mailer");
+const coreBankingClient = require("../utils/coreBankingClient");
+const ENDPOINTS = require("../utils/coreEndpoints");
+
+// ✅ Read directly from ENV
+const INSTITUTION_CODE = process.env.MFB_CODE;
+
+if (!INSTITUTION_CODE) {
+  console.warn("⚠️ MFB_CODE is not set in environment variables");
+}
+class LoanService {
+
+  static normalizeName(name) {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+static cleanBase64(value) {
+  if (!value) return undefined;
+
+  let cleaned = String(value).trim();
+
+  // remove full data URI prefix if present
+  cleaned = cleaned.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, "");
+
+  // remove wrapping quotes or trailing comma from copied JSON fragments
+  cleaned = cleaned.replace(/^"+|"+$/g, "");
+  cleaned = cleaned.replace(/,$/, "");
+
+  // remove whitespace/newlines
+  cleaned = cleaned.replace(/\s+/g, "");
+
+  return cleaned || undefined;
+}
+
+static isNameMatch(bvnFullName, accountName) {
+  const cleanBVN = LoanService.normalizeName(bvnFullName);
+  const cleanAccount = LoanService.normalizeName(accountName);
+
+  if (!cleanBVN || !cleanAccount) return false;
+
+  // Exact match
+  if (cleanBVN === cleanAccount) return true;
+
+  const bvnParts = cleanBVN.split(" ").filter(Boolean);
+  const accountParts = cleanAccount.split(" ").filter(Boolean);
+
+  const matchedParts = bvnParts.filter((part) =>
+    accountParts.includes(part)
+  );
+
+  // Relaxed rule:
+  // pass if at least 2 name parts match
+  // or one full name contains the other
+  return (
+    matchedParts.length >= 1 ||
+    cleanBVN.includes(cleanAccount) ||
+    cleanAccount.includes(cleanBVN)
+  );
+}
+
+
+  /* ==================================================
+   CENTRALIZED LOAN SETTINGS LOADER
+================================================== */
+static async getLoanSettings(client = null) {
+  const db = client || pool;
+
+  const res = await db.query(
+    `SELECT loan_settings FROM system_settings LIMIT 1`
+  );
+
+  if (!res.rows.length) {
+    throw new Error("Loan settings not found");
+  }
+
+  return res.rows[0].loan_settings || {};
+}
+
+  /**
+   * ==================================================
+   * PUBLIC LOAN SUBMISSION (INTERNAL ONLY)
+   * ==================================================
+   */
+  static async createLoanApplication(payload) {
+const client = await pool.connect();
+
+try {
+await client.query("BEGIN");
+  const {
+    loanSessionId,
+    crmStaffId,
+    productCode,
+    dynamic = {},
+  } = payload;
+
+  /* ================= VALIDATE SESSION ================= */
+  const sessionRes = await client.query(
+    `
+    SELECT id, bvn_verified_at, nin_verified_at
+    FROM loan_sessions
+    WHERE id = $1
+    `,
+    [loanSessionId]
+  );
+
+  if (!sessionRes.rows.length) {
+    throw new Error("Invalid loan session");
+  }
+
+  const session = sessionRes.rows[0];
+
+  
+if (!session) {
+  throw new Error("Customer verification incomplete");
+}
+
+  /* ================= PREVENT DUPLICATES ================= */
+  const existingLoan = await client.query(
+  `SELECT id FROM loans WHERE session_id = $1 FOR UPDATE`,
+  [loanSessionId]
+);
+
+  if (existingLoan.rows.length) {
+    throw new Error("Loan already submitted for this session");
+  }
+
+  /* ================= LOAD LOAN SETTINGS ================= */
+ 
+ const loanConfig = await LoanService.getLoanSettings();
+  /* ================= PRODUCT VALIDATION ================= */
+  if (!productCode) {
+    throw new Error("Loan product code missing");
+  }
+
+  const productMeta =
+    loanConfig.productMeta?.[productCode];
+
+  if (!productMeta) {
+    throw new Error(`Loan product ${productCode} not configured`);
+  }
+
+  console.log("📦 Dynamic payload received:", dynamic);
+
+  /* ================= SALARY ACCOUNT DETECTION ================= */
+  /* ================= SALARY ACCOUNT DETECTION ================= */
+
+// 1️⃣ Try strict known key first
+let salaryAccountNumber =
+  dynamic.field_account_number ||
+  dynamic.salary_account_number ||
+  dynamic.account_number ||
+  null;
+
+// 2️⃣ Fallback: try fuzzy detection
+if (!salaryAccountNumber) {
+  const detectedKey = Object.keys(dynamic).find(key =>
+    key.toLowerCase().includes("account")
+  );
+
+  if (detectedKey) {
+    salaryAccountNumber = String(dynamic[detectedKey]).trim();
+  }
+}
+
+if (!salaryAccountNumber) {
+  throw new Error("Salary account number is required");
+}
+
+if (!/^\d{10,11}$/.test(salaryAccountNumber)) {
+  throw new Error("Invalid salary account number format");
+}
+
+console.log("Detected salary account:", salaryAccountNumber);
+
+  /* ================= LOAN AMOUNT VALIDATION ================= */
+  const amountField = Object.keys(dynamic).find(
+    key => key.toLowerCase().includes("amount")
+  );
+
+  const loanAmount = Number(dynamic[amountField] || 0);
+
+  console.log("Detected amount field:", amountField);
+  console.log("Parsed loan amount:", loanAmount);
+
+  if (!loanAmount || loanAmount <= 0) {
+    throw new Error("Invalid loan amount");
+  }
+
+  if (
+    productMeta.minAmount &&
+    loanAmount < Number(productMeta.minAmount)
+  ) {
+    throw new Error(
+      `Minimum allowed amount is ₦${Number(
+        productMeta.minAmount
+      ).toLocaleString()}`
+    );
+  }
+
+  if (
+    productMeta.maxAmount &&
+    loanAmount > Number(productMeta.maxAmount)
+  ) {
+    throw new Error(
+      `Maximum allowed amount is ₦${Number(
+        productMeta.maxAmount
+      ).toLocaleString()}`
+    );
+  }
+
+  /* ================= GENERATE ABBREVIATION ================= */
+  let abbreviation = productMeta.abbreviation;
+
+  if (!abbreviation && productMeta.name) {
+    abbreviation = productMeta.name
+      .split(" ")
+      .map((w) => w[0])
+      .join("")
+      .toUpperCase();
+  }
+
+  if (!abbreviation) {
+    throw new Error(
+      `Abbreviation not set for loan product ${
+        productMeta.name || productCode
+      }`
+    );
+  }
+
+  /* ================= GENERATE TRACKING ID ================= */
+  const loanId = uuidv4();
+  const prefix = abbreviation.toUpperCase();
+
+  const dateStr = new Date()
+    .toISOString()
+    .slice(2, 10)
+    .replace(/-/g, "");
+
+  const seqResult = await client.query(`
+    INSERT INTO loan_daily_sequence (loan_date, last_seq)
+    VALUES (CURRENT_DATE, 1)
+    ON CONFLICT (loan_date)
+    DO UPDATE SET last_seq = loan_daily_sequence.last_seq + 1
+    RETURNING last_seq
+  `);
+
+  const sequence = String(seqResult.rows[0].last_seq).padStart(4, "0");
+  const loanCode = `${prefix}-${dateStr}-${sequence}`;
+
+
+  /* ================= RESOLVE ACCOUNT OFFICER ================= */
+  let resolvedStaffId = null;
+
+  if (crmStaffId && crmStaffId !== "") {
+    const officerRes = await client.query(
+      `
+      SELECT id, core_staff_code
+FROM users
+WHERE id = $1
+LIMIT 1
+      `,
+      [Number(crmStaffId)]
+    );
+
+    if (!officerRes.rows.length) {
+      throw new Error("Selected account officer not found in users table");
+    }
+
+    resolvedStaffId = Number(officerRes.rows[0].id);
+  }
+  
+
+  /* ================= CREATE LOAN ================= */
+ 
+const bankCode =
+  payload.bank_code ||
+  dynamic.field_bank_code ||
+  dynamic.bank_code ||
+  null;
+
+const bankName =
+  payload.bank_name ||
+  dynamic.field_bank_name ||
+  dynamic.bank_name ||
+  null;
+
+
+const customerAccountNumber =
+  payload.account_number ||
+  dynamic.field_account_number ||
+  dynamic.account_number ||
+  salaryAccountNumber ||
+  null;
+
+await client.query(
+  `
+  INSERT INTO loans (
+    id,
+    loan_code,
+    session_id,
+    crm_staff_id,
+    product_code,
+    salary_account_number,
+    bank_code,
+    bank_name,
+account_number,
+    status,
+    core_status,
+    disbursement_status,
+    created_at
+  )
+  VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    'PENDING_REVIEW',
+    'NOT_CREATED',
+    'NOT_DISBURSED',
+    NOW()
+  )
+  `,
+  [
+    loanId,
+    loanCode,
+    loanSessionId,
+    resolvedStaffId,
+    productCode,
+    salaryAccountNumber,
+    bankCode,
+    bankName,
+    customerAccountNumber,
+  ]
+);
+
+  /* ================= ENRICH BANK NAME BEFORE SAVING ================= */
+
+/* ================= SAVE BANK NAME FROM FRONTEND ================= */
+if (bankCode) {
+  dynamic.bank_code = bankCode;
+}
+
+if (bankName) {
+  dynamic.bank_name = bankName;
+}
+
+if (customerAccountNumber) {
+  dynamic.account_number = customerAccountNumber;
+}
+
+/* ================= SAVE DYNAMIC ANSWERS ================= */
+await client.query(
+  `
+  INSERT INTO loan_answers (loan_id, answers)
+  VALUES ($1, $2)
+  `,
+  [loanId, JSON.stringify(dynamic)]
+);
+
+await client.query("COMMIT");
+  return {
+    success: true,
+    message: "Loan submitted successfully and awaiting approval",
+    loanId,
+    loanCode,
+  };
+} catch (err) {
+
+  await client.query("ROLLBACK");
+
+  console.error("❌ Loan creation failed:", err.message);
+
+  throw err;
+
+} finally {
+
+  client.release();
+
+}
+}
+static async validateSalaryAccount(loanId, externalClient = null) {
+
+  const client = externalClient || await pool.connect();
+
+  try {
+
+    /* =====================================================
+       1️⃣ LOAD LOAN + SESSION DATA
+    ===================================================== */
+    const loanRes = await client.query(`
+     SELECT
+  l.salary_account_number,
+  ls.salary_bank_code,
+  la.answers,
+  ls.first_name,
+  ls.last_name
+      FROM loans l
+      JOIN loan_answers la ON la.loan_id = l.id
+      JOIN loan_sessions ls ON ls.id = l.session_id
+      WHERE l.id = $1
+    `, [loanId]);
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const loan = loanRes.rows[0];
+
+let customerId = loan.core_customer_id;
+
+
+    if (!loan.salary_account_number) {
+      throw new Error("Salary account number missing");
+    }
+
+    const parsedAnswers =
+      typeof loan.answers === "string"
+        ? JSON.parse(loan.answers)
+        : loan.answers || {};
+
+    /* =====================================================
+       2️⃣ DETECT BANK CODE
+    ===================================================== */
+let bankCode =
+  loan.salary_bank_code ||
+  parsedAnswers.field_select_bank ||
+  parsedAnswers.bank_code ||
+  parsedAnswers.bank ||
+  null;
+
+if (!bankCode) {
+  const bankKey = Object.keys(parsedAnswers).find(k =>
+    k.toLowerCase().includes("bank") &&
+    !k.toLowerCase().includes("name")
+  );
+
+  if (bankKey) {
+    bankCode = parsedAnswers[bankKey];
+  }
+}
+
+if (bankCode) {
+  bankCode = String(bankCode).trim();
+}
+
+console.log("🔍 Parsed answers:", parsedAnswers);
+console.log("🏦 Detected bank code:", bankCode);
+    if (!bankCode) {
+      const detectedKey = Object.keys(parsedAnswers).find(key =>
+        key.toLowerCase().includes("bank") &&
+        !key.toLowerCase().includes("name")
+      );
+
+      if (detectedKey) {
+        bankCode = parsedAnswers[detectedKey];
+      }
+    }
+
+    if (!bankCode) {
+      throw new Error("Bank code missing");
+    }
+
+    /* =====================================================
+       3️⃣ CALL NAME ENQUIRY
+    ===================================================== */
+    
+
+const payload = {
+  AccountNumber: String(loan.salary_account_number).trim(),
+  BankCode: String(bankCode).trim(),
+  Token: process.env.CORE_API_KEY
+};
+
+console.log("🔍 NAME ENQUIRY VALIDATION INPUT");
+console.log("AccountNumber:", payload.AccountNumber);
+console.log("BankCode:", payload.BankCode);
+console.log("Token exists:", !!payload.Token);
+console.log("Payload:", payload);
+
+const nameEnquiry = await coreBankingClient.post(
+  ENDPOINTS.TRANSFER.NAME_ENQUIRY,
+  payload
+);
+
+console.log("🏦 NAME ENQUIRY RESPONSE:");
+console.log(nameEnquiry?.data);
+    if (!nameEnquiry?.data?.IsSuccessful) {
+      return {
+        success: false,
+        valid: false,
+        message:
+          nameEnquiry?.data?.ResponseMessage ||
+          "Invalid account number"
+      };
+    }
+
+    // ✅ Correct field based on your API response
+    const accountName = nameEnquiry?.data?.Name;
+
+    if (!accountName) {
+      throw new Error("Account name not returned from name enquiry");
+    }
+
+    /* =====================================================
+       4️⃣ COMPARE NAMES
+    ===================================================== */
+    const bvnFullName = `${loan.first_name} ${loan.last_name}`;
+
+    const isMatch = LoanService.isNameMatch(
+      bvnFullName,
+      accountName
+    );
+
+if (!isMatch) {
+  return {
+    success: false,
+    valid: false,
+    message: "Salary account validation failed",
+    bvnName: bvnFullName,
+    accountName
+  };
+}    
+
+    /* =====================================================
+       5️⃣ SAVE VERIFIED ACCOUNT NAME
+    ===================================================== */
+    await client.query(
+      `
+      UPDATE loans
+      SET salary_account_name = $2
+      WHERE id = $1
+      `,
+      [loanId, accountName]
+    );
+
+    return {
+      success: true,
+      valid: true,
+      accountNumber: loan.salary_account_number,
+      accountName
+    };
+
+  } catch (err) {
+
+    console.error("❌ Salary validation error:", err.message);
+
+    return {
+      success: false,
+      valid: false,
+      message: err.message || "Unable to validate salary account"
+    };
+
+  } finally {
+    if (!externalClient) client.release();
+  }
+}
+
+/* * LOAN APPROVAL (CREDIT / ADMIN)*/
+static async approveLoan(
+  {
+    loanId,
+    approverId,
+    comment,
+    approved_amount,
+    approved_tenor,
+    approved_interest_rate
+  },
+  externalClient = null
+)
+{
+
+ const client = externalClient || await pool.connect();
+const manageTransaction = !externalClient;
+
+
+  try {
+   if (manageTransaction) {
+  await client.query("BEGIN");
+}
+
+    const loanRes = await client.query(
+      `
+      SELECT status, core_status, product_code, crm_staff_id, session_id
+      FROM loans
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [loanId]
+    );
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const loan = loanRes.rows[0];
+
+    if (loan.status !== "PENDING_REVIEW") {
+      throw new Error(`Loan cannot be approved. Current status: ${loan.status}`);
+    }
+
+    if (loan.crm_staff_id === approverId) {
+      throw new Error("You cannot approve a loan you created.");
+    }
+
+    const duplicateCheck = await client.query(
+      `
+      SELECT 1
+      FROM loan_approvals
+      WHERE loan_id = $1
+      AND approver_id = $2
+      AND approval_status = 'APPROVED'
+      `,
+      [loanId, approverId]
+    );
+
+    if (duplicateCheck.rows.length) {
+      throw new Error("You have already approved this loan.");
+    }
+
+    const loanConfig = await LoanService.getLoanSettings(client);
+
+    const productConfig =
+      loanConfig.productApprovals?.[loan.product_code];
+
+    if (!productConfig) {
+      throw new Error("Product approval configuration missing");
+    }
+
+    const requiredLevels =
+      productConfig?.approvers || 1;
+
+    const levelRes = await client.query(
+      `
+      SELECT COALESCE(MAX(approval_level), 0) AS current_level
+      FROM loan_approvals
+      WHERE loan_id = $1
+      AND approval_status = 'APPROVED'
+      `,
+      [loanId]
+    );
+
+    const currentLevel = Number(levelRes.rows[0].current_level);
+    const nextLevel = currentLevel + 1;
+
+    if (nextLevel > requiredLevels) {
+      throw new Error("All approval levels already completed");
+    }
+
+/* ✅ ADD VALIDATION HERE */
+if (!approved_amount || approved_amount <= 0) {
+  throw new Error("Approved amount must be provided before approval.");
+}
+    await client.query(
+  `
+  INSERT INTO loan_approvals
+  (
+    loan_id,
+    approver_id,
+    approval_level,
+    approval_status,
+    approval_reason,
+    approved_amount,
+    approved_tenor,
+    approved_interest_rate
+  )
+  VALUES ($1,$2,$3,'APPROVED',$4,$5,$6,$7)
+  `,
+  [
+    loanId,
+    approverId,
+    nextLevel,
+    comment || null,
+    approved_amount,
+approved_tenor,
+approved_interest_rate
+  ]
+);
+    let finalStatus = "PENDING_NEXT_LEVEL";
+
+    /* =====================================================
+       FINAL LEVEL → RESOLVE ACCOUNT FIRST
+    ===================================================== */
+/* =====================================================
+   FINAL LEVEL → RESOLVE ACCOUNT FIRST
+===================================================== */
+if (nextLevel === requiredLevels) {
+
+  const oldStatus = loan.status;
+
+  await client.query(`
+    UPDATE loans
+    SET status = 'APPROVED',
+        approved_at = NOW(),
+        updated_at = NOW()
+    WHERE id = $1
+  `, [loanId]);
+
+  await LoanService.logLoanStatusChange(
+    {
+      loanId,
+      oldStatus,
+      newStatus: "APPROVED",
+      changedBy: approverId,
+      reason: "Final approval"
+    },
+    client
+  );
+
+  finalStatus = "APPROVED";
+}
+
+  if (manageTransaction) {
+  await client.query("COMMIT");
+}
+return {
+  success: true,
+  level: nextLevel,
+  finalStatus,
+  message:
+    finalStatus === "APPROVED"
+      ? "Loan fully approved"
+      : "Approval recorded. Awaiting next level"
+};
+
+  } catch (err) {
+
+    if (manageTransaction) {
+  await client.query("ROLLBACK");
+}
+    console.error("❌ LoanService Error:", {
+      message: err.message,
+      loanId,
+      approverId,
+    });
+
+    throw err;
+
+  } finally {
+   if (manageTransaction) {
+  client.release();
+}
+
+  }
+}
+
+static async resolveSettlementAccount(loanId, externalClient = null) {
+
+  const client = externalClient || await pool.connect();
+  const manageTransaction = !externalClient;
+
+  try {
+
+    if (manageTransaction) {
+      await client.query("BEGIN");
+    }
+
+    const loanRes = await client.query(`
+     SELECT
+  l.product_code,
+  l.session_id,
+  l.core_status,
+  l.settlement_account_number,
+  l.crm_staff_id,
+  ls.core_customer_id
+FROM loans l
+JOIN loan_sessions ls
+  ON ls.id = l.session_id
+WHERE l.id = $1
+FOR UPDATE
+    `, [loanId]);
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const loan = loanRes.rows[0];
+
+let customerId = loan.core_customer_id;
+    /* =====================================================
+       🔁 ALREADY RESOLVED
+    ===================================================== */
+// ✅ ADD THIS BLOCK HERE
+const loanConfig = await LoanService.getLoanSettings(client);
+
+const productConfig =
+  loanConfig.productApprovals?.[loan.product_code];
+
+
+let accounts = [];
+
+try {
+  const accByCustomer = await coreBankingClient.get(
+    ENDPOINTS.ACCOUNT.GET_BY_CUSTOMER_ID,
+    {
+      params: { customerId: String(loan.core_customer_id) }
+    }
+  );
+
+  const raw1 = accByCustomer?.data;
+
+  if (Array.isArray(raw1?.Message?.Accounts)) {
+    accounts = raw1.Message.Accounts;
+  } else if (Array.isArray(raw1?.Accounts)) {
+    accounts = raw1.Accounts;
+  } else if (Array.isArray(raw1?.Message)) {
+    accounts = raw1.Message;
+  }
+
+  const seen = new Set();
+
+  accounts = accounts.filter((acc) => {
+    const key = String(
+      acc.AccountNumber ||
+      acc.accountNumber ||
+      acc.NUBAN ||
+      acc.nuban ||
+      ""
+    )
+      .replace(/\s/g, "")
+      .replace(/^0+/, "")
+      .trim();
+
+    if (!key || seen.has(key)) return false;
+
+    seen.add(key);
+    return true;
+  });
+
+} catch (err) {
+  accounts = [];
+}
+
+
+if (!productConfig) {
+  throw new Error("Product configuration missing");
+}
+
+const requiredProductCode =
+  productConfig?.accountOpeningProductCode;
+
+   
+if (
+  loan.core_status === "ACCOUNT_RESOLVED" &&
+  loan.settlement_account_number
+) {
+  console.log("🔍 Validating existing settlement account...");
+
+
+
+// ===== DEBUG =====
+console.log("📦 CUSTOMER ACCOUNTS:", accounts.length);
+  
+
+
+
+const valid = accounts.find(acc => {
+  const accNum = String(
+    acc.AccountNumber ||
+    acc.accountNumber ||
+    acc.NUBAN ||
+    ""
+  )
+    .replace(/\s/g, "")
+    .replace(/^0+/, "")
+    .trim();
+
+  const loanAcc = String(
+    loan.settlement_account_number || ""
+  )
+    .replace(/\s/g, "")
+    .replace(/^0+/, "")
+    .trim();
+
+  return (
+    accNum === loanAcc &&
+    String(acc.ProductCode || acc.productCode) === String(requiredProductCode) &&
+    String(acc.AccountStatus || acc.accountStatus).toUpperCase() === "ACTIVE"
+  );
+});
+  if (valid) {
+    console.log("✅ Existing settlement account is valid");
+
+    if (manageTransaction) await client.query("COMMIT");
+
+    return {
+      success: true,
+      accountNumber: loan.settlement_account_number,
+      reused: true,
+    };
+  }
+
+  console.log("⚠️ Stored account invalid → will create correct one");
+}
+
+
+/* =====================================================
+   🔍 STEP 1: CHECK CORE IF NOT IN DB
+===================================================== */
+
+let coreCheck = null;
+
+// ✅ ONLY call coreCheck if customerId is missing
+if (!customerId) {
+  console.log("🔍 No local customerId → checking core...");
+
+  coreCheck = await LoanService.checkCoreCustomerByLoanId(loanId);
+
+  if (coreCheck?.exists && coreCheck?.customer) {
+    customerId =
+      coreCheck.customer.CustomerID ||
+      coreCheck.customer.customerID;
+
+    console.log("✅ Customer exists in core:", customerId);
+
+    await client.query(`
+      UPDATE loan_sessions
+      SET core_customer_id = $2
+      WHERE id = $1
+    `, [loan.session_id, customerId]);
+  }
+}
+
+/* =====================================================
+   ❌ STEP 2: STILL NOT FOUND → CREATE CUSTOMER + ACCOUNT
+===================================================== */
+
+if (!customerId) {
+
+  console.log("❌ Customer not found anywhere → creating new");
+
+  const created =
+  await LoanService.createCustomerAndAccountFromSession(
+    loan.session_id,
+    productConfig.accountOpeningProductCode,
+    loan.crm_staff_id,
+    client
+  );
+
+  await client.query(`
+    UPDATE loan_sessions
+    SET core_customer_id = $2
+    WHERE id = $1
+  `, [loan.session_id, created.customerId]);
+
+  await client.query(`
+    UPDATE loans
+    SET core_status = 'ACCOUNT_RESOLVED',
+        settlement_account_number = $2
+    WHERE id = $1
+  `, [loanId, created.accountNumber]);
+
+  if (manageTransaction) await client.query("COMMIT");
+
+  return {
+    success: true,
+    accountNumber: created.accountNumber,
+    reused: false,
+  };
+}
+
+
+
+/* =====================================================
+   ✅ CUSTOMER EXISTS → CHECK IF ACCOUNT ALREADY EXISTS
+===================================================== */
+
+
+
+console.log("📦 Accounts received:",
+accounts.map(a => ({
+  acc: a.AccountNumber || a.accountNumber,
+  product: a.ProductCode || a.productCode,
+  status: a.AccountStatus || a.accountStatus
+}))  
+);
+
+const existingAccount = accounts.find(acc =>
+  String(acc.ProductCode || acc.productCode) === String(requiredProductCode) &&
+  String(acc.AccountStatus || acc.accountStatus).toUpperCase() === "ACTIVE"
+);
+
+if (existingAccount?.AccountNumber) {
+
+  console.log("✅ Reusing correct settlement account:",
+    existingAccount.AccountNumber
+  );
+
+  await client.query(`
+    UPDATE loans
+    SET core_status = 'ACCOUNT_RESOLVED',
+        settlement_account_number = $2
+    WHERE id = $1
+  `, [loanId, existingAccount.AccountNumber]);
+
+  if (manageTransaction) {
+    await client.query("COMMIT");
+  }
+
+  return {
+    success: true,
+    accountNumber: existingAccount.AccountNumber,
+    reused: true,
+  };
+}
+
+
+    /* =====================================================
+       🔒 TRANSITION TO ACCOUNT_CREATING
+    ===================================================== */
+    const updateRes = await client.query(`
+      UPDATE loans
+      SET core_status = 'ACCOUNT_CREATING'
+      WHERE id = $1
+      AND core_status != 'ACCOUNT_RESOLVED'
+    `, [loanId]);
+
+    // 🔒 Another process already resolved it
+    if (updateRes.rowCount === 0) {
+
+      const alreadyResolved = await client.query(`
+        SELECT settlement_account_number
+        FROM loans
+        WHERE id = $1
+      `, [loanId]);
+
+      const existingAccount =
+        alreadyResolved.rows[0]?.settlement_account_number;
+
+      if (existingAccount) {
+        return {
+          success: true,
+          accountNumber: existingAccount,
+          reused: true,
+        };
+      }
+
+      throw new Error("Unable to transition loan to ACCOUNT_CREATING");
+    }
+
+    /* =====================================================
+       🏦 CUSTOMER EXISTS → CREATE ACCOUNT QUICK
+    ===================================================== */
+    const created = await LoanService.createAccountForCustomer(
+      customerId,
+      productConfig.accountOpeningProductCode,
+      loan.session_id,
+      client
+    );
+
+    if (!created?.accountNumber) {
+      throw new Error("Account creation did not return account number");
+    }
+
+    await client.query(`
+      UPDATE loans
+      SET
+        core_status = 'ACCOUNT_RESOLVED',
+        settlement_account_number = $2
+      WHERE id = $1
+    `, [loanId, created.accountNumber]);
+
+    if (manageTransaction) {
+      await client.query("COMMIT");
+    }
+
+    return {
+      success: true,
+      accountNumber: created.accountNumber,
+      reused: false,
+    };
+
+  } catch (err) {
+
+    if (manageTransaction) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error("❌ resolveSettlementAccount error:", err.message);
+
+    throw err;
+
+  } finally {
+
+    if (manageTransaction) {
+      client.release();
+    }
+
+  }
+}
+
+static async createCustomerAndAccountFromSession(
+  sessionId,
+  productCode,
+  crmStaffId = null,
+  externalClient = null
+) {
+  const client = externalClient || await pool.connect();
+  const manageTransaction = !externalClient;
+
+  try {
+    if (manageTransaction) {
+      await client.query("BEGIN");
+    }
+
+    /* ================= LOAD SESSION ================= */
+    const sessionRes = await client.query(
+      `
+      SELECT *
+      FROM loan_sessions
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [sessionId]
+    );
+
+    if (!sessionRes.rows.length) {
+      throw new Error("Loan session not found");
+    }
+
+    const session = sessionRes.rows[0];
+
+
+let finalOfficerCode = null;
+
+if (crmStaffId) {
+  const officerRes = await client.query(
+    `
+    SELECT id, core_staff_code
+    FROM users
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [crmStaffId]
+  );
+
+  if (officerRes.rows.length) {
+    finalOfficerCode = officerRes.rows[0].core_staff_code || null;
+  }
+}
+
+if (!finalOfficerCode) {
+  finalOfficerCode = process.env.TEST_CORE_STAFF_CODE || null;
+}
+
+if (!finalOfficerCode) {
+  throw new Error("Account officer code is missing in users table and env fallback");
+}
+
+
+    if (!session.bvn) {
+      throw new Error("[CUSTOMER_CREATION_KYC_ERROR] BVN missing from session");
+    }
+
+    /* ================= FORMAT DOB ================= */
+    
+
+/* ================= FORMAT DOB ================= */
+const verificationRes = await client.query(
+  `
+  SELECT verification_payload
+  FROM identity_verifications
+  WHERE bvn = $1
+  ORDER BY verified_at DESC
+  LIMIT 1
+  `,
+  [session.bvn]
+);
+
+const verificationPayloadRaw = verificationRes.rows[0]?.verification_payload || {};
+
+const verificationPayload =
+  typeof verificationPayloadRaw === "string"
+    ? JSON.parse(verificationPayloadRaw)
+    : verificationPayloadRaw;
+
+
+const customerPhotoRaw =
+  verificationPayload.image ||
+  verificationPayload.photo ||
+  verificationPayload.passportPhotograph ||
+  verificationPayload.passport_photo ||
+  verificationPayload.customerPhoto ||
+  null;
+
+const customerSignatureRaw =
+  verificationPayload.signature ||
+  verificationPayload.customerSignature ||
+  null;
+
+const identificationImageRaw =
+  verificationPayload.identificationImage ||
+  verificationPayload.idImage ||
+  verificationPayload.documentImage ||
+  verificationPayload.meansOfIdentification ||
+  verificationPayload.idCardImage ||
+  null;
+
+const identificationNumberRaw =
+  verificationPayload.idNumber ||
+  verificationPayload.nin ||
+  session.nin ||
+  "";
+
+const rawDob =
+  verificationPayload.dateOfBirth ||
+  verificationPayload.DateOfBirth ||
+  verificationPayload.dob ||
+  verificationPayload.DOB ||
+  session.date_of_birth ||
+  null;
+
+if (!rawDob) {
+  throw new Error("[CUSTOMER_CREATION_KYC_ERROR] Date of birth missing");
+}
+
+// normalize date safely
+let dob;
+
+if (typeof rawDob === "string" && rawDob.includes("-")) {
+  dob = new Date(rawDob);
+} else {
+  dob = new Date(rawDob);
+}
+
+if (!dob || isNaN(dob.getTime())) {
+  console.log("❌ Invalid DOB value:", rawDob);
+  throw new Error("[CUSTOMER_CREATION_KYC_ERROR] Invalid date_of_birth format");
+}
+
+const formattedDOB = dob
+  .toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  })
+  .replace(/ /g, "-");
+
+console.log("🎂 DOB DEBUG:", {
+  rawDob,
+  formattedDOB,
+});
+    const trackingRef = `CUS-${uuidv4()}`;
+
+   
+/* ================= EMAIL FALLBACK ================= */
+
+let fallbackEmail = null;
+
+if (session.first_name) {
+  const cleanName = session.first_name
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+
+  fallbackEmail = `${cleanName}${Date.now().toString().slice(-4)}@gmail.com`;
+}
+
+const email =
+  session.email && session.email.includes("@")
+    ? session.email
+    : fallbackEmail || `${trackingRef}@gmail.com`;
+
+/* ================= BUILD PAYLOAD ================= */
+
+const payload = {
+  TransactionTrackingRef: trackingRef,
+  AccountOpeningTrackingRef: trackingRef,
+  ProductCode: String(productCode),
+
+  LastName: session.last_name,
+  OtherNames: session.first_name,
+
+  BVN: String(session.bvn),
+
+  PhoneNo: session.phone_number || "08000000000",
+
+  Gender: Number(session.gender || 0),
+
+  DateOfBirth: formattedDOB,
+
+  Address: session.address || "Nigeria",
+
+  AccountOfficerCode: String(finalOfficerCode),
+  Email: email,
+
+  /* ================= OPTIONAL KYC ================= */
+  CustomerPhoto: LoanService.cleanBase64(customerPhotoRaw),
+  CustomerSignature: LoanService.cleanBase64(customerSignatureRaw),
+  IdentificationImage: LoanService.cleanBase64(identificationImageRaw),
+  IdentificationNumber: identificationNumberRaw,
+
+  /* ================= SYSTEM DEFAULTS ================= */
+  AccountTier: 3,
+  TransactionPermission: 0,
+};
+
+
+
+console.log("📸 IMAGE DEBUG", {
+  hasCustomerPhoto: !!payload.CustomerPhoto,
+  hasCustomerSignature: !!payload.CustomerSignature,
+  hasIdentificationImage: !!payload.IdentificationImage,
+  hasIdentificationNumber: !!payload.IdentificationNumber,
+  customerPhotoPreview: payload.CustomerPhoto?.slice?.(0, 30),
+  customerSignaturePreview: payload.CustomerSignature?.slice?.(0, 30),
+  identificationImagePreview: payload.IdentificationImage?.slice?.(0, 30),
+});
+
+    console.log("CREATE CUSTOMER & ACCOUNT PAYLOAD:");
+    console.log(JSON.stringify(payload, null, 2));
+
+    /* ================= CALL CORE ================= */
+    const response = await coreBankingClient.post(
+      ENDPOINTS.ACCOUNT.CREATE_CUSTOMER_AND_ACCOUNT,
+      payload
+    );
+
+    console.log("🔥 FULL CREATE_CUSTOMER_AND_ACCOUNT RESPONSE:");
+    console.log(JSON.stringify(response?.data, null, 2));
+
+    if (!response?.data?.IsSuccessful) {
+      throw new Error(
+  "[CUSTOMER_CREATION_CORE_ERROR] " +
+  (response?.data?.Message || "Core rejected CreateCustomerAndAccount")
+);
+    }
+
+    const data = response.data;
+    const message = data?.Message || {};
+
+    /* ================= EXTRACT IDS ================= */
+    let customerId =
+      message.CustomerID ||
+      message.customerID ||
+      message.CustomerIDInString ||
+      data.CustomerID ||
+      data.customerID ||
+      null;
+
+    let accountNumber =
+      message.AccountNumber ||
+      message.accountNumber ||
+      message.NUBAN ||
+      data.AccountNumber ||
+      data.NUBAN ||
+      null;
+
+    /* ================= FALLBACK IF MISSING ================= */
+   /* ================= FALLBACK IF MISSING ================= */
+if (!customerId || !accountNumber) {
+
+  console.log("⚠️ Core did not return IDs. Fetching via TrackingRef...");
+
+  const fetchByTrackingRef = await coreBankingClient.get(
+    ENDPOINTS.ACCOUNT.GET_BY_TRACKING_REF,
+    {
+      params: {
+        transactionTrackingRef: trackingRef,
+        computewithdrawableBalance: true
+      }
+    }
+  );
+
+  console.log("🔎 TRACKING REF RESPONSE:");
+  console.log(JSON.stringify(fetchByTrackingRef?.data, null, 2));
+
+  const accountData = fetchByTrackingRef?.data;
+
+  if (!accountData || accountData.IsSuccessful === false) {
+    throw new Error(
+      accountData?.Message ||
+      "Account created but could not fetch via tracking ref"
+    );
+  }
+
+  accountNumber =
+    accountData.AccountNumber ||
+    accountData.NUBAN;
+
+  customerId =
+    accountData.CustomerID ||
+    accountData.CustomerIDInString;
+
+  if (!accountNumber) {
+    throw new Error("Account number missing from tracking ref response");
+  }
+}
+    if (!customerId || !accountNumber) {
+      throw new Error("Core did not return IDs");
+    }
+
+    if (manageTransaction) {
+      await client.query("COMMIT");
+    }
+
+    return {
+      success: true,
+      customerId,
+      accountNumber,
+      reused: false,
+    };
+
+  } catch (err) {
+    if (manageTransaction) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error(
+      "❌ createCustomerAndAccountFromSession error:",
+      err.response?.data || err.message
+    );
+
+    throw err;
+
+  } finally {
+    if (manageTransaction) {
+      client.release();
+    }
+  }
+}
+
+
+
+
+static getCustomerByBVN(bvn) {
+
+  return coreBankingClient.get(
+    ENDPOINTS.CUSTOMER.GET_BY_BVN,
+    {
+      params: {
+        BVN: String(bvn),
+        institutionCode: INSTITUTION_CODE
+      }
+    }
+  );
+
+}
+
+  /**
+   * ==================================================
+   * CORE METHODS (AFTER APPROVAL ONLY)
+   * ==================================================
+   */
+
+static async getLoansByCustomerId(customerId) {
+
+  console.log("Fetching loan balance for customer:", customerId);
+
+  return coreBankingClient.get(
+    "/BankOneWebAPI/api/LoanAccount/LoanAccountBalance2/2",
+    {
+      params: {
+        authToken: process.env.CORE_API_KEY,
+        customerIDInString: String(customerId)
+      }
+    }
+  );
+
+}
+
+
+static getRepaymentSchedule(loanAccountNumber) {
+  return coreBankingClient.get(
+    ENDPOINTS.LOAN.GET_REPAYMENT_SCHEDULE,
+    {
+      params: {
+        authToken: process.env.CORE_API_KEY,
+        mfbCode: INSTITUTION_CODE,
+        loanAccountNumber: String(loanAccountNumber),
+      },
+      headers: {
+        accept: "application/json",
+      },
+    }
+  );
+}
+  
+
+static async sendLoanScheduleEmail({
+  to,
+  customerName,
+  loanCode,
+  loanAccountNumber,
+  schedule = []
+}) {
+  if (!to) {
+    console.warn("⚠️ No customer email found in loan answers, skipping schedule email");
+    return false;
+  }
+
+  
+const rows = schedule.map((item, index) => `
+  <tr>
+    <td style="padding:8px;border:1px solid #ddd;">${index + 1}</td>
+    <td style="padding:8px;border:1px solid #ddd;">
+      ${item.PaymentDueDate ? new Date(item.PaymentDueDate).toLocaleDateString("en-NG") : "-"}
+    </td>
+    <td style="padding:8px;border:1px solid #ddd;">₦${Number(String(item.Principal || 0).replace(/,/g, "")).toLocaleString()}</td>
+    <td style="padding:8px;border:1px solid #ddd;">₦${Number(String(item.Interest || 0).replace(/,/g, "")).toLocaleString()}</td>
+    <td style="padding:8px;border:1px solid #ddd;">₦${Number(String(item.Total || 0).replace(/,/g, "")).toLocaleString()}</td>
+  </tr>
+`).join("");
+
+  const body = `
+    <p>Dear <strong>${customerName}</strong>,</p>
+
+    <p>Your loan has been successfully created.</p>
+
+    <div style="
+      margin:20px 0;
+      padding:15px;
+      background:#eef6ff;
+      border-left:4px solid #0f3d6e;
+      border-radius:6px;
+      line-height:1.8;
+    ">
+      <p><strong>Loan Code:</strong> ${loanCode}</p>
+      <p><strong>Loan Account Number:</strong> ${loanAccountNumber}</p>
+    </div>
+
+    <p>Please find your repayment schedule below:</p>
+
+    <table style="border-collapse:collapse;width:100%;margin-top:10px;">
+      <thead>
+        <tr>
+          <th style="padding:8px;border:1px solid #ddd;">#</th>
+          <th style="padding:8px;border:1px solid #ddd;">Due Date</th>
+          <th style="padding:8px;border:1px solid #ddd;">Principal</th>
+          <th style="padding:8px;border:1px solid #ddd;">Interest</th>
+          <th style="padding:8px;border:1px solid #ddd;">Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || `<tr><td colspan="5" style="padding:8px;border:1px solid #ddd;">No schedule available</td></tr>`}
+      </tbody>
+    </table>
+
+    <p style="margin-top:20px;">
+      Thank you for choosing <strong>Mutual Trust Microfinance Bank</strong>.
+    </p>
+  `;
+
+  return sendStyledMail({
+    to,
+    subject: `Loan Repayment Schedule - ${loanCode}`,
+    title: "Loan Repayment Schedule",
+    body,
+  });
+}
+
+  
+static async saveRepaymentSchedule(
+  {
+    loanId,
+    loanAccountNumber,
+    schedule = []
+  },
+  externalClient = null
+) {
+  if (!loanId) {
+    throw new Error("loanId is required to save repayment schedule");
+  }
+
+  if (!loanAccountNumber) {
+    throw new Error("loanAccountNumber is required to save repayment schedule");
+  }
+
+  if (!Array.isArray(schedule) || !schedule.length) {
+    console.warn("⚠️ No repayment schedule to save");
+    return { success: true, inserted: 0 };
+  }
+
+  const client = externalClient || await pool.connect();
+
+  try {
+    let inserted = 0;
+
+    for (const item of schedule) {
+      const dueDateRaw = item.PaymentDueDate || item.dueDate;
+      if (!dueDateRaw) continue;
+
+      const dueDate = new Date(dueDateRaw);
+      if (Number.isNaN(dueDate.getTime())) continue;
+
+      await client.query(
+        `
+        INSERT INTO loan_repayment_schedules (
+          loan_id,
+          loan_account_number,
+          schedule_ref_id,
+          due_date,
+          principal,
+          interest,
+          fee,
+          total,
+          is_principal_applied,
+          is_interest_applied,
+          is_fee_applied,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW()
+        )
+        ON CONFLICT (loan_id, schedule_ref_id)
+        DO UPDATE SET
+          loan_account_number = EXCLUDED.loan_account_number,
+          schedule_ref_id = EXCLUDED.schedule_ref_id,
+          principal = EXCLUDED.principal,
+          interest = EXCLUDED.interest,
+          fee = EXCLUDED.fee,
+          is_principal_applied = EXCLUDED.is_principal_applied,
+          is_interest_applied = EXCLUDED.is_interest_applied,
+          is_fee_applied = EXCLUDED.is_fee_applied,
+          updated_at = NOW()
+        `,
+        [
+          loanId,
+          String(loanAccountNumber),
+          item.Id ? Number(item.Id) : null,
+          dueDate,
+          Number(String(item.Principal || 0).replace(/,/g, "")),
+Number(String(item.Interest || 0).replace(/,/g, "")),
+Number(String(item.Fee || 0).replace(/,/g, "")),
+Number(String(item.Total || 0).replace(/,/g, "")),
+          Boolean(item.IsPrincipalApplied),
+          Boolean(item.IsInterestApplied),
+          Boolean(item.IsFeeApplied),
+        ]
+      );
+
+      inserted += 1;
+    }
+
+    console.log(`✅ Repayment schedule saved for loan ${loanId}: ${inserted} row(s)`);
+
+    return {
+      success: true,
+      inserted,
+    };
+  } finally {
+    if (!externalClient) client.release();
+  }
+}
+
+
+static async getLoanBalance(loanAccountNumber) {
+
+const response = await coreBankingClient.get(
+  ENDPOINTS.LOAN.GET_BALANCE,
+  {
+    headers: {
+      Accept: "application/json",        // ✅ FIX 406 ERROR
+      "Content-Type": "application/json"
+    },
+    params: {
+      LoanAccountNumber: String(loanAccountNumber),
+      institutionCode: INSTITUTION_CODE,
+      authToken: process.env.CORE_API_KEY   // ✅ VERY IMPORTANT
+    }
+  }
+);
+  const data = response?.data;
+
+  const balance =
+    data?.Message?.OutstandingBalance ||
+    data?.OutstandingBalance ||
+    0;
+
+  return {
+    balance,
+    raw: data
+  };
+}
+
+static getLoanStatement(accountNumber, fromDate, toDate) {
+  return coreBankingClient.get(
+    ENDPOINTS.LOAN_ACCOUNT.GET_STATEMENT,
+    {
+      params: {
+        accountNumber,
+        fromDate,
+        toDate,
+        institutionCode: INSTITUTION_CODE,
+      },
+    }
+  );
+}
+
+
+  static repayLoan(payload) {
+    return coreBankingClient.post(
+      ENDPOINTS.LOAN_ACCOUNT.REPAY_LOAN,
+      {
+        ...payload,
+        institutionCode: INSTITUTION_CODE,
+      }
+    );
+  }
+
+
+  
+
+
+  /**
+ * ==================================================
+ * CREATE LOAN IN CORE BANKING (BANKONE)
+ * ==================================================
+ * Only called AFTER internal approval
+ */
+static async createLoanInCoreBanking(
+  loanId,
+  overrides = {},
+  externalClient = null
+) {
+console.log("🔥 createLoanInCoreBanking INPUT loanId:", loanId);
+
+  const client = externalClient || await pool.connect();
+  const manageTransaction = !externalClient;
+
+  try {
+    if (manageTransaction) {
+      await client.query("BEGIN");
+    }
+
+    /* ======================================================
+       1️⃣ LOCK & LOAD LOAN
+    ====================================================== */
+    const loanRes = await client.query(
+      `
+SELECT
+  l.id,
+  l.loan_code,
+  l.status,
+  l.product_code,
+  l.core_status,
+ l.loan_account_opening_refid, 
+ l.core_loan_account_number,
+  l.settlement_account_number,
+  l.crm_staff_id,
+  la.answers,
+  ls.core_customer_id
+FROM loans l
+JOIN loan_answers la ON la.loan_id = l.id
+JOIN loan_sessions ls ON ls.id = l.session_id
+WHERE l.id = $1
+FOR UPDATE      `,
+      [loanId]
+    );
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const loan = loanRes.rows[0];
+
+    if (loan.status !== "APPROVED") {
+      throw new Error("Loan must be internally approved first");
+    }
+
+    /* ======================================================
+       2️⃣ IDEMPOTENCY CHECK
+    ====================================================== */
+ 
+if (
+  loan.loan_account_opening_refid &&
+  ["CREATED", "DISBURSED"].includes(loan.core_status)
+) {
+  return {
+    success: true,
+    loanReference: loan.loan_account_opening_refid,
+    settlementAccountNumber: loan.settlement_account_number || null,
+    loanAccountNumber: loan.core_loan_account_number || null,
+    scheduleFetched: !!loan.core_loan_account_number,
+  };
+}
+
+
+    if (!loan.core_customer_id) {
+      throw new Error("Core customer ID missing");
+    }
+
+    
+
+if (!loan.settlement_account_number) {
+  throw new Error("Settlement account not resolved");
+}
+
+const parsedAnswers =
+  typeof loan.answers === "string"
+    ? JSON.parse(loan.answers)
+    : loan.answers || {};
+
+
+const customerEmail =
+  parsedAnswers.field_email ||
+  parsedAnswers.email ||
+  parsedAnswers.Email ||
+  parsedAnswers.customer_email ||
+  parsedAnswers.mail ||
+  parsedAnswers.field_customers_email_address ||
+  null;
+
+const customerName =
+  parsedAnswers.full_name ||
+  parsedAnswers.name ||
+  parsedAnswers.customer_name ||
+  "Customer";
+
+
+
+    /* ======================================================
+       3️⃣ EXTRACT AMOUNT
+    ====================================================== */
+    const originalAmount = Number(
+  parsedAnswers.field_loan_amount ||
+  parsedAnswers.field_amount ||
+  parsedAnswers.amount
+);
+
+
+const loanAmount =
+  Number(overrides?.approved_amount) > 0
+    ? Number(overrides.approved_amount)
+    : originalAmount;
+
+
+    if (!loanAmount || loanAmount <= 0) {
+      throw new Error("Invalid loan amount");
+    }
+
+    /* ======================================================
+       4️⃣ EXTRACT TENURE
+    ====================================================== */
+    const originalTenure = Number(
+  parsedAnswers.field_loan_tenure_months ||
+  parsedAnswers.field_tenure ||
+  parsedAnswers.tenure ||
+  parsedAnswers.tenor
+);
+
+
+    const finalTenure =
+      overrides.tenor ??
+      overrides.tenure ??
+      originalTenure;
+
+    if (!finalTenure || finalTenure <= 0) {
+      throw new Error("Invalid tenure");
+    }
+
+    /* ======================================================
+       5️⃣ SAFE OVERRIDES
+    ====================================================== */
+    let finalInterestRate =
+      overrides.interest_rate ??
+      parsedAnswers.field_interest_rate ??
+      24;
+
+    if (!finalInterestRate || finalInterestRate < 5) {
+      finalInterestRate = 24;
+    }
+
+
+const loanConfig = await LoanService.getLoanSettings(client);
+
+
+
+let rawMoratorium =
+  overrides.approved_moratorium ??
+  overrides.moratorium ??
+  parsedAnswers.field_moratorium ??
+parsedAnswers.moratorium ??
+loanConfig.defaultMoratorium;
+// ✅ check BEFORE converting
+if (
+  rawMoratorium === undefined ||
+  rawMoratorium === null ||
+  rawMoratorium === ""
+) {
+  rawMoratorium = 30;
+}
+
+let finalMoratorium = Number(rawMoratorium);
+
+// fallback again if still bad
+if (isNaN(finalMoratorium)) {
+  finalMoratorium = 30;
+}
+
+// 🚨 rule
+if (finalMoratorium >= finalTenure) {
+  finalMoratorium = 0;
+}
+
+
+    const finalComputationMode = 0; // Safe default
+
+    /* ======================================================
+       6️⃣ BUILD CORE PAYLOAD
+
+
+    ====================================================== */
+ 
+let staffCode = null;
+
+// 1️⃣ Try user-linked core account officer code
+if (loan.crm_staff_id) {
+  const officerRes = await client.query(
+  `
+  SELECT id, core_staff_code
+  FROM users
+  WHERE id = $1
+  LIMIT 1
+  `,
+  [loan.crm_staff_id]
+);
+
+  if (officerRes.rows.length) {
+    staffCode = officerRes.rows[0].core_staff_code || null;
+  }
+}
+
+// 2️⃣ Fallback to env
+if (!staffCode) {
+  staffCode = process.env.TEST_CORE_STAFF_CODE || null;
+}
+
+if (!staffCode) {
+  throw new Error("Account officer code is missing in users table and env fallback");
+}
+
+const ippisValue =
+  overrides?.ippis ??
+  parsedAnswers?.field_ippis ??
+  parsedAnswers?.ippis ??
+  null;
+
+const economicSector =
+  overrides?.economic_sector ?? 12;
+
+console.log("LOAN SERVICE DEBUG:", {
+  ippisValue,
+  economicSector,
+  tenor: finalTenure
+});
+
+const loanPayload = {
+  TransactionTrackingRef: loan.loan_code,
+
+  LoanProductCode: String(loan.product_code),
+
+  CustomerID: String(loan.core_customer_id),
+
+  LinkedAccountNumber: String(loan.settlement_account_number),
+
+  CollateralType: "SALARY",
+
+  CollateralDetails:
+    parsedAnswers.field_collateral_details ||
+    "Salary-backed loan",
+
+  ComputationMode: finalComputationMode,
+
+Tenure: String(finalTenure),
+Moratorium: String(finalMoratorium),  
+
+InterestAccrualCommencementDate:
+  new Date().toLocaleDateString("en-GB").replace(/\//g, "-"),
+
+  Amount: String(loanAmount),
+InterestRate: String(finalInterestRate),
+
+PrincipalPaymentFrequency: "2",
+InterestPaymentFrequency: "2",
+
+PrincipalRepaymentType: "1",
+InterestRepaymentType: "1",
+InterestAccrualMode: "1",
+
+
+AccountOfficerStaffCode: String(staffCode),
+
+EconomicSector: Number(economicSector),
+
+  DoNotApplyLoanFees: false,
+
+ ...(ippisValue ? { IPPIS: String(ippisValue) } : {}),
+ 
+};
+
+
+    console.log("🚀 FINAL LOAN PAYLOAD:");
+    console.log(JSON.stringify(loanPayload, null, 2));
+
+    /* ======================================================
+       7️⃣ CALL CORE (AUTO-FUNDS PRODUCT)
+    ====================================================== */
+    const coreResponse =
+      await coreBankingClient.post(
+        ENDPOINTS.LOAN.CREATE_APPLICATION,
+        loanPayload
+      );
+
+ console.log("🔥 FULL CORE LOAN RESPONSE:");
+console.log(JSON.stringify(coreResponse?.data, null, 2));
+
+/* ================= EXTRACT TRACKING REF ================= */
+const loanAccountOpeningRefId =
+  coreResponse?.data?.TransactionTrackingRef ||
+  coreResponse?.data?.transactionTrackingRef ||
+  coreResponse?.data?.Message?.TransactionTrackingRef ||
+  coreResponse?.data?.message?.transactionTrackingRef ||
+  null;
+
+console.log("📌 Extracted loan_account_opening_refid:", loanAccountOpeningRefId);
+
+    
+const coreData = coreResponse?.data || {};
+const creationMessage = String(
+  coreData?.Message?.CreationMessage ||
+  coreData?.Message ||
+  ""
+).toLowerCase();
+
+const alreadyCreated =
+  creationMessage.includes("already been created");
+
+if (!coreData?.IsSuccessful && !alreadyCreated) {
+  throw new Error(
+    typeof coreData?.Message === "string"
+      ? coreData.Message
+      : "Core rejected loan creation"
+  );
+}    
+
+    /* ======================================================
+       8️⃣ EXTRACT FUNDED ACCOUNT NUMBER
+    ====================================================== */
+let settlementAccountNumber =
+  coreData?.Message?.BankoneAccountNumber ||
+  coreData?.BankoneAccountNumber ||
+  null;
+
+let loanAccountNumber = null;
+
+    /* ======================================================
+       9️⃣ FALLBACK FETCH IF NOT RETURNED
+    ====================================================== */
+    
+
+if (loanAccountOpeningRefId) {
+  console.log("⚠️ Fetching loan account number via transaction tracking ref.");
+
+  for (let i = 0; i < 5; i++) {
+    const accountByRef = await coreBankingClient.get(
+      ENDPOINTS.ACCOUNT.GET_BY_TRACKING_REF,
+      {
+        params: {
+          authtoken: process.env.CORE_API_KEY,
+          transactionTrackingRef: String(loanAccountOpeningRefId),
+          computewithdrawableBalance: true,
+        },
+        headers: {
+          accept: "application/json",
+        },
+      }
+    );
+
+    console.log(`🔁 TRACKING REF ATTEMPT ${i + 1}:`);
+    console.log(JSON.stringify(accountByRef?.data, null, 2));
+
+
+
+const trackedAccountType =
+  accountByRef?.data?.AccountType ||
+  accountByRef?.data?.Message?.AccountType ||
+  "";
+
+if (
+  trackedAccountType &&
+  String(trackedAccountType).toLowerCase() !== "loan"
+) {
+  console.warn("⚠️ Tracking ref returned non-loan account:", trackedAccountType);
+  loanAccountNumber = null;
+} else {
+  loanAccountNumber =
+    accountByRef?.data?.AccountNumber ||
+    accountByRef?.data?.Message?.AccountNumber ||
+    null;
+}
+
+
+    if (loanAccountNumber) {
+      break;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+    
+const creationRef = loanAccountOpeningRefId || null;
+
+if (!creationRef) {
+  throw new Error("Core loan reference not returned");
+}
+
+console.log("📌 About to save settlement account:", settlementAccountNumber);
+console.log("📌 Existing loan core_status before save:", loan.core_status);
+
+console.log("✅ Settlement account from create response:", settlementAccountNumber);
+console.log("✅ Loan account from tracking ref:", loanAccountNumber);
+
+    /* ======================================================
+       🔟 UPDATE DATABASE
+    ====================================================== */
+
+if (settlementAccountNumber && loanAccountNumber && settlementAccountNumber === loanAccountNumber) {
+  console.warn("⚠️ Settlement and loan account are the same before DB save. Ignoring loan account overwrite risk.");
+}
+
+
+console.log("✅ CREATE RESPONSE RAW:", JSON.stringify(coreData, null, 2));
+console.log("✅ Settlement account from create response:", settlementAccountNumber);
+console.log("✅ Loan account from tracking ref:", loanAccountNumber);
+console.log("✅ Existing DB settlement before update:", loan.settlement_account_number);
+
+
+const updateResult = await client.query(
+  `
+  UPDATE loans
+  SET core_status = 'CREATED',
+      loan_account_opening_refid = $2,
+      settlement_account_number = COALESCE(settlement_account_number, $3::text),
+core_loan_account_number = COALESCE($4::text, core_loan_account_number),
+      core_created_at = NOW()
+  WHERE id = $1
+  RETURNING id, core_status, settlement_account_number, core_loan_account_number
+  `,
+  [
+    loanId,
+    creationRef,
+    settlementAccountNumber || null,
+    loanAccountNumber || null
+  ]
+);
+
+console.log("✅ LOAN DB UPDATE RESULT:", updateResult.rows);
+console.log("✅ LOAN DB UPDATE COUNT:", updateResult.rowCount);
+
+
+ if (manageTransaction) {
+  await client.query("COMMIT");
+}
+
+
+if (loanAccountNumber) {
+  try {
+    const scheduleResponse = await LoanService.getRepaymentSchedule(loanAccountNumber);
+
+    const repaymentSchedule =
+      scheduleResponse?.data?.Message ||
+      scheduleResponse?.data?.RepaymentSchedule ||
+      scheduleResponse?.data ||
+      [];
+
+    await LoanService.saveRepaymentSchedule(
+      {
+        loanId,
+        loanAccountNumber,
+        schedule: Array.isArray(repaymentSchedule) ? repaymentSchedule : [],
+      },
+      client
+    );
+
+    console.log("📅 REPAYMENT SCHEDULE RESPONSE:");
+    console.log(JSON.stringify(scheduleResponse?.data, null, 2));
+
+    await LoanService.sendLoanScheduleEmail({
+      to: customerEmail,
+      customerName,
+      loanCode: loan.loan_code,
+      loanAccountNumber,
+      schedule: Array.isArray(repaymentSchedule) ? repaymentSchedule : [],
+    });
+  } catch (mailErr) {
+    console.error("❌ Failed to fetch/save/send repayment schedule:", mailErr.message);
+  }
+} else {
+  console.log("ℹ️ Loan created in core without immediate loan account number. Schedule fetch skipped.");
+}
+
+
+return {
+  success: true,
+  loanReference: creationRef,
+  settlementAccountNumber: settlementAccountNumber || loan.settlement_account_number,
+  loanAccountNumber: loanAccountNumber || null,
+  scheduleFetched: !!loanAccountNumber,
+};
+
+  } catch (err) {
+
+    if (manageTransaction) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error(
+      "❌ createLoanInCoreBanking error:",
+      err.message
+    );
+
+    throw err;
+
+  } finally {
+    if (manageTransaction) {
+      client.release();
+    }
+  }
+}
+static async createAccountForCustomer(
+  customerId,
+  settlementProductCode, // renamed for clarity
+  sessionId,
+  externalClient = null
+) {
+
+  const client = externalClient || await pool.connect();
+  const manageTransaction = !externalClient;
+
+  try {
+
+    if (manageTransaction) {
+      await client.query("BEGIN");
+    }
+
+    /* ==============================
+       1️⃣ VALIDATE PRODUCT CODE
+    ============================== */
+
+    const productCode = settlementProductCode;
+
+    if (!productCode) {
+      throw new Error("Settlement product code missing");
+    }
+
+    /* ==============================
+       2️⃣ VERIFY CUSTOMER EXISTS IN CORE
+    ============================== */
+
+    let customerResponse;
+
+    try {
+      customerResponse = await coreBankingClient.get(
+        ENDPOINTS.CUSTOMER.GET_BY_ID,
+        {
+          params: {
+            CustomerID: String(customerId),
+          },
+        }
+      );
+    } catch (err) {
+      throw new Error("Core customer validation failed");
+    }
+
+    const rawCustomer = customerResponse?.data;
+
+    if (!rawCustomer || rawCustomer.IsSuccessful === false) {
+      throw new Error(rawCustomer?.Message || "Customer not found in core");
+    }
+
+    const customer = rawCustomer?.Message || rawCustomer;
+
+    if (!customer || (!customer.customerID && !customer.CustomerID)) {
+      throw new Error("[QUICK_ACCOUNT_CORE_ERROR] Customer not found in core");
+    }
+
+    console.log(
+      "✅ Core customer verified:",
+      customer.CustomerID || customer.customerID
+    );
+
+    /* ==============================
+       3️⃣ CHECK IF ACCOUNT ALREADY EXISTS
+    ============================== */
+
+    const accountsResponse = await coreBankingClient.get(
+      ENDPOINTS.ACCOUNT.GET_BY_CUSTOMER_ID,
+      {
+        params: {
+          customerId: String(customerId),
+        },
+      }
+    );
+
+    const rawAccounts = accountsResponse?.data;
+
+    let accounts = [];
+
+    if (Array.isArray(rawAccounts?.Accounts)) {
+      accounts = rawAccounts.Accounts;
+    } else if (Array.isArray(rawAccounts?.Message)) {
+      accounts = rawAccounts.Message;
+    }
+
+// ✅ ADD THIS RIGHT HERE
+const seen = new Set();
+
+accounts = accounts.filter(acc => {
+  const key = String(
+    acc.AccountNumber ||
+    acc.accountNumber ||
+    acc.NUBAN ||
+    ""
+  )
+    .replace(/\s/g, "")
+    .replace(/^0+/, "")
+    .trim();
+
+  if (!key || seen.has(key)) {
+    return false;
+  }
+
+  seen.add(key);
+  return true;
+});
+
+    const existingAccount = accounts.find(
+      (acc) =>
+        String(acc.ProductCode || acc.productCode) ===
+        String(productCode)
+    );
+
+    if (existingAccount) {
+
+      if (manageTransaction) {
+        await client.query("COMMIT");
+      }
+
+      return {
+        success: true,
+        accountNumber:
+          existingAccount.AccountNumber ||
+          existingAccount.accountNumber,
+        reused: true,
+      };
+    }
+
+    /* ==============================
+       4️⃣ CREATE NEW ACCOUNT
+    ============================== */
+
+const loanConfig = await LoanService.getLoanSettings(client);
+
+let finalOfficerCode = null;
+
+// 1️⃣ Try to get account officer code from linked loan officer in users table
+const loanRes = await client.query(
+  `
+  SELECT crm_staff_id
+  FROM loans
+  WHERE session_id = $1
+  ORDER BY created_at DESC
+  LIMIT 1
+  `,
+  [sessionId]
+);
+
+const crmStaffId = loanRes.rows[0]?.crm_staff_id || null;
+
+if (crmStaffId) {
+  
+const officerRes = await client.query(
+  `
+  SELECT id, core_staff_code
+  FROM users
+  WHERE id = $1
+  LIMIT 1
+  `,
+  [crmStaffId]
+);
+
+  if (officerRes.rows.length) {
+    finalOfficerCode = officerRes.rows[0].core_staff_code || null;
+  }
+}
+
+// 2️⃣ Fallback to env
+if (!finalOfficerCode) {
+  finalOfficerCode = process.env.TEST_CORE_STAFF_CODE || null;
+}
+
+if (!finalOfficerCode) {
+  throw new Error("Account officer code is missing in users table and env fallback");
+}    
+
+
+    const trackingRef =
+  Date.now().toString().slice(-12);
+
+    const sessionRes = await client.query(
+      `
+      SELECT bvn, date_of_birth
+      FROM loan_sessions
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [sessionId]
+    );
+
+    if (!sessionRes.rows.length) {
+      throw new Error("Loan session not found");
+    }
+
+    const sessionData = sessionRes.rows[0];
+
+    
+
+const finalBVN =
+  sessionData?.bvn ||
+  customer?.BankVerificationNumber ||
+  null;
+
+if (!finalBVN) {
+  throw new Error("[QUICK_ACCOUNT_KYC_ERROR] BVN missing (session + core)");
+}
+
+
+/* ==============================
+   RESOLVE DOB (SMART FALLBACK)
+============================== */
+
+let formattedDOB = null;
+
+// 1️⃣ Try session DOB
+if (sessionData?.date_of_birth) {
+  const dob = new Date(sessionData.date_of_birth);
+
+  if (!isNaN(dob)) {
+    formattedDOB = dob
+      .toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      })
+      .replace(/ /g, "-");
+  }
+}
+
+// 2️⃣ Try core DOB
+if (!formattedDOB && customer?.DateOfBirth) {
+  const coreDob = new Date(customer.DateOfBirth);
+
+  if (!isNaN(coreDob)) {
+    formattedDOB = coreDob
+      .toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      })
+      .replace(/ /g, "-");
+  }
+}
+
+// 3️⃣ FINAL FALLBACK (IMPORTANT)
+if (!formattedDOB) {
+  console.warn("⚠️ DOB missing → using default fallback");
+
+  // Core usually accepts this safe fallback
+  formattedDOB = "01-Jan-1990";
+}
+
+
+
+const rawPhone =
+  customer.PhoneNumber ||
+  customer.PhoneNo ||
+  customer.phoneNumber ||
+  "";    
+
+    let normalizedPhone = rawPhone.replace(/\D/g, "");
+
+    if (normalizedPhone.length === 10) {
+      normalizedPhone = "0" + normalizedPhone;
+    }
+
+    if (
+      normalizedPhone.startsWith("234") &&
+      normalizedPhone.length === 13
+    ) {
+      normalizedPhone = "0" + normalizedPhone.slice(3);
+    }
+
+    if (normalizedPhone.length !== 11) {
+      throw new Error("Invalid phone number format for core");
+    }
+
+    let genderValue = 0;
+
+    if (
+      customer.Gender === 1 ||
+      String(customer.Gender).toLowerCase() === "female"
+    ) {
+      genderValue = 1;
+    }
+
+    const fullName =
+      `${customer.LastName} ${customer.OtherNames}`.trim();
+
+    const placeOfBirth =
+      customer.PlaceOfBirth ||
+      customer.placeOfBirth ||
+      "Nigeria";
+
+
+
+let fallbackEmail = null;
+
+if (customer?.OtherNames) {
+  const cleanName = customer.OtherNames
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+
+  fallbackEmail = `${cleanName}${Date.now().toString().slice(-4)}@gmail.com`;
+}
+
+const email =
+  customer.Email && customer.Email.includes("@")
+    ? customer.Email
+    : fallbackEmail || `${trackingRef}@gmail.com`;
+    const accountPayload = {
+      TransactionTrackingRef: trackingRef,
+      AccountOpeningTrackingRef: trackingRef,
+      ProductCode: String(productCode),
+      CustomerID: String(customerId),
+
+      FullName: fullName,
+      LastName: customer.LastName,
+      OtherNames: customer.OtherNames,
+
+      BVN: String(finalBVN),
+      PhoneNo: normalizedPhone,
+      Gender: Number(genderValue),
+
+      PlaceOfBirth: placeOfBirth,
+      DateOfBirth: formattedDOB,
+      Address: customer.Address || "Nigeria",
+
+      AccountOfficerCode: String(finalOfficerCode),
+
+     Email: email,
+
+      NotificationPreference:
+        loanConfig?.coreDefaults?.notificationPreference ?? 0,
+
+      TransactionPermission: 0,
+      AccountTier: 3,
+      AccountReferenceNumber: trackingRef.slice(-6),
+    };
+
+    console.log(
+      "FINAL ACCOUNT PAYLOAD:",
+      JSON.stringify(accountPayload, null, 2)
+    );
+
+    const accountCreation = await coreBankingClient.post(
+      ENDPOINTS.ACCOUNT.CREATE_ACCOUNT_QUICK,
+      accountPayload
+    );
+
+    if (!accountCreation?.data?.IsSuccessful) {
+      const creationMessage =
+        accountCreation?.data?.Message?.CreationMessage ||
+        accountCreation?.data?.Message ||
+        "Core rejected account creation";
+
+      throw new Error(
+        typeof creationMessage === "string"
+          ? creationMessage
+          : JSON.stringify(creationMessage)
+      );
+    }
+
+    const accountNumber =
+      accountCreation?.data?.Message?.AccountNumber;
+
+    if (!accountNumber) {
+      throw new Error("[QUICK_ACCOUNT_CORE_ERROR] Core did not return account number");
+    }
+
+    if (manageTransaction) {
+      await client.query("COMMIT");
+    }
+
+    return {
+      success: true,
+      accountNumber,
+      reused: false,
+    };
+
+  } catch (err) {
+
+    if (manageTransaction) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error(
+      "❌ createAccountForCustomer error:",
+      err.response?.data || err.message
+    );
+
+    throw err;
+
+  } finally {
+
+    if (manageTransaction) {
+      client.release();
+    }
+  }
+}
+
+
+/**
+ * ==================================================
+ * RETURN LOAN (FOR CORRECTION)
+ * ==================================================
+ */
+static async returnLoan({ loanId, approverId, reason, files = [] }) {
+
+ const client = await pool.connect();
+
+
+  try {
+    await client.query("BEGIN");
+
+   const loanRes = await client.query(
+  `SELECT status, crm_staff_id FROM loans WHERE id = $1 FOR UPDATE`,
+  [loanId]
+);
+
+if (!loanRes.rows.length) {
+  throw new Error("Loan not found");
+}
+
+const loan = loanRes.rows[0];
+
+if (loan.status !== "PENDING_REVIEW") {
+  throw new Error("Loan is no longer pending review");
+}
+
+if (loan.crm_staff_id === approverId) {
+  throw new Error("You cannot perform this action on a loan you created.");
+}
+
+
+    const cleanReason = reason?.trim();
+
+if (!cleanReason) {
+  throw new Error("Reason is required.");
+}
+
+
+      // ✅ ADD THIS BLOCK HERE
+    const approvalCheck = await client.query(
+      `
+      SELECT COUNT(*) AS approved_count
+      FROM loan_approvals
+      WHERE loan_id = $1
+      AND approval_status = 'APPROVED'
+      `,
+      [loanId]
+    );
+
+    const approvedCount = Number(approvalCheck.rows[0].approved_count);
+
+    if (approvedCount > 0) {
+      throw new Error("Loan cannot be returned after partial approval.");
+    }
+
+
+    const approvalInsert = await client.query(
+  `
+  INSERT INTO loan_approvals
+  (loan_id, approver_id, approval_level, approval_status, approval_reason)
+  VALUES ($1, $2, 0, 'RETURNED', $3)
+  RETURNING id
+  `,
+ [loanId, approverId, cleanReason]
+
+);
+
+const approvalId = approvalInsert.rows[0].id;
+if (files?.length) {
+  for (const file of files) {
+  await client.query(
+    `
+    INSERT INTO loan_approval_files
+    (loan_id, approval_id, file_name, file_path, uploaded_by)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [
+      loanId,
+      approvalId,
+      file.originalname,
+      file.path,
+      approverId
+    ]
+  );
+}
+  }
+
+   const oldStatus = loan.status;
+
+await client.query(
+  `
+  UPDATE loans
+  SET status = 'RETURNED'
+  WHERE id = $1
+  `,
+  [loanId]
+);
+
+await LoanService.logLoanStatusChange(
+  {
+    loanId,
+    oldStatus,
+    newStatus: "RETURNED",
+    changedBy: approverId,
+    reason: cleanReason
+  },
+  client
+);
+
+   await client.query("COMMIT");
+
+    return { success: true };
+
+ } catch (err) {
+  await client.query("ROLLBACK");
+
+  console.error("❌ LoanService Error:", {
+    message: err.message,
+    stack: err.stack,
+    loanId: loanId || null,
+    approverId: approverId || null,
+  });
+
+  throw err;
+} finally {
+  client.release();
+}
+
+}
+
+
+
+
+
+/* ======================================================
+   FULL LOAN LIFECYCLE (FINAL APPROVAL FLOW)
+====================================================== */
+static async processLoanLifecycle(
+  loanId,
+  approverId,
+  overrides = {}
+) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    /* =====================================================
+       1️⃣ LOCK LOAN
+    ===================================================== */
+ const lockRes = await client.query(
+  `SELECT * FROM loans WHERE id = $1 FOR UPDATE`,
+  [loanId]
+);
+
+if (!lockRes.rows.length) {
+  throw new Error("Loan not found");
+}
+
+let loan = lockRes.rows[0];
+/* 🚫 PREVENT PROCESSING INVALID STATES */
+if (loan.status === "REJECTED") {
+  throw new Error("Rejected loans cannot be processed.");
+}
+
+if (loan.status === "RETURNED") {
+  throw new Error("Returned loans must be corrected before processing.");
+}
+
+
+    if (loan.lifecycle_status === "BLOCKED_BY_DOCUMENT") {
+  throw new Error("Loan is blocked due to rejected document.");
+}
+
+
+if (loan.lifecycle_status === "PROCESSING") {
+  throw new Error(
+    "Loan is currently being processed by another administrator."
+  );
+}
+
+
+
+
+    /* =====================================================
+       🚫 BLOCK IF ANY DOCUMENT IS REJECTED
+    ===================================================== */
+    const rejectedDocs = await client.query(`
+      SELECT lsd.id
+      FROM loan_session_documents lsd
+      JOIN loans l ON l.session_id = lsd.session_id
+      WHERE l.id = $1
+     AND COALESCE(lsd.status, 'PENDING') = 'REJECTED'
+    `, [loanId]);
+
+    if (rejectedDocs.rows.length > 0) {
+      throw new Error(
+        "Loan cannot be processed while a document is rejected."
+      );
+    }
+/* 🔒 LOCK LIFECYCLE */
+await client.query(`
+UPDATE loans
+SET lifecycle_status = 'PROCESSING',
+    updated_at = NOW()
+WHERE id = $1
+`, [loanId]);
+    /* =====================================================
+       2️⃣ PREVENT DOUBLE PROCESSING
+    ===================================================== */
+    if (loan.disbursement_status === "COMPLETED") {
+      await client.query("COMMIT");
+      return {
+        success: true,
+        message: "Loan already fully processed"
+      };
+    }
+
+    const retryingTransfer =
+      loan.disbursement_status === "AWAITING_MANUAL_FUNDING";
+
+    /* =====================================================
+       3️⃣ FINAL INTERNAL APPROVAL
+    ===================================================== */
+    if (!retryingTransfer && loan.status !== "APPROVED") {
+
+      const approvalResult =
+        await LoanService.approveLoan(
+          { loanId, approverId, comment: "Final approval" },
+          client
+        );
+
+      if (approvalResult.finalStatus !== "APPROVED") {
+        await client.query("COMMIT");
+        return {
+          success: true,
+          message: "Approval recorded. Awaiting next level."
+        };
+      }
+    }
+
+    /* =====================================================
+       4️⃣ ENSURE SETTLEMENT ACCOUNT EXISTS
+    ===================================================== */
+    
+
+// ✅ ALWAYS ensure settlement exists
+if (!loan.settlement_account_number) {
+
+  console.log("⚠️ Settlement missing → creating...");
+
+  const settlement =
+    await LoanService.resolveSettlementAccount(
+      loanId,
+      client
+    );
+
+  if (!settlement?.accountNumber) {
+    throw new Error("Settlement account resolution failed");
+  }
+
+console.log("🔥 Reload loanId:", loanId);
+  const reload = await client.query(
+    `SELECT * FROM loans WHERE id = $1`,
+    [loanId]
+  );
+
+console.log("🔥 Reload result:", reload.rows);
+
+if (!reload.rows.length) {
+  throw new Error("Loan not found at reload stage");
+}
+
+  loan = reload.rows[0];
+}
+
+    /* =====================================================
+       5️⃣ VALIDATE SALARY ACCOUNT
+    ===================================================== */
+    const salaryValidation =
+      await LoanService.validateSalaryAccount(
+        loanId,
+        client
+      );
+
+    if (!salaryValidation?.valid) {
+      throw new Error(
+        salaryValidation?.message ||
+        "Salary account validation failed"
+      );
+    }
+
+
+    /* =====================================================
+   🚫 BLOCK IF CUSTOMER HAS ACTIVE CORE LOAN
+===================================================== */
+
+if (loan.core_customer_id) {
+
+  const coreLoansResponse =
+    await LoanService.getLoansByCustomerId(
+      loan.core_customer_id
+    );
+
+  const loansList =
+    coreLoansResponse?.data?.Message?.Loans ||
+    coreLoansResponse?.data?.Message ||
+    coreLoansResponse?.data?.Loans ||
+    [];
+
+
+console.log("🔥 CORE LOANS RAW:", JSON.stringify(loansList, null, 2));
+const activeCoreLoans = loansList.filter(l => {
+
+  const status = String(
+    l.LoanStatus || l.status || ""
+  ).toUpperCase();
+
+  const outstanding = Number(
+    l.OutstandingBalance ||
+    l.outstandingBalance ||
+    0
+  );
+
+  const closedStatuses = [
+    "CLOSED",
+    "LIQUIDATED",
+    "COMPLETED",
+    "SETTLED"
+  ];
+
+  return (
+    !closedStatuses.includes(status) &&
+    outstanding > 1
+  );
+});
+
+  if (activeCoreLoans.length > 0) {
+    throw new Error(
+      "Customer already has an active loan in core banking. Disbursement blocked."
+    );
+  }
+}
+
+    /* =====================================================
+       6️⃣ CREATE LOAN IN CORE
+    ===================================================== */
+    
+let fundedAccount = loan.core_loan_account_number;
+
+// ✅ ALWAYS reuse if exists
+if (fundedAccount) {
+  console.log("♻️ Reusing existing loan account:", fundedAccount);
+}
+
+// ✅ Only create if truly missing
+if (!retryingTransfer && !fundedAccount) {
+
+  console.log("🚀 Creating loan in core...");
+
+    let coreCreateResult;
+
+for (let i = 0; i < 3; i++) {
+  try {
+    coreCreateResult = await LoanService.createLoanInCoreBanking(
+      loanId,
+      overrides,
+      client
+    );
+    break;
+  } catch (err) {
+    const msg = String(err?.message || "").toLowerCase();
+
+    const shouldWait =
+      msg.includes("currently been created") ||
+      msg.includes("please wait") ||
+      msg.includes("processing");
+
+    if (!shouldWait || i === 2) {
+      throw err;
+    }
+
+    console.log(`⏳ Loan creation retry ${i + 1}/3 - core says wait`);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+}
+const coreLoan = coreCreateResult;
+
+fundedAccount = coreLoan.loanAccountNumber || null;
+const loanReference = coreLoan.loanReference || null;
+
+if (!fundedAccount) {
+  console.log(
+    "ℹ️ Core loan created without immediate loan account number. Using reference:",
+    loanReference
+  );
+}  
+
+}
+
+    /* =====================================================
+       7️⃣ MARK AS DISBURSED TO SETTLEMENT
+    ===================================================== */
+    if (!retryingTransfer) {
+      
+await client.query(`
+UPDATE loans
+SET core_status = 'DISBURSED',
+    disbursement_status = 'COMPLETED',
+    status = 'DISBURSED',
+    disbursed_at = NOW()
+WHERE id = $1
+`, [loanId]);
+
+    }
+
+    /* =====================================================
+       8️⃣ LOAD UPDATED DATA
+    ===================================================== */
+    const reload = await client.query(`
+      SELECT
+       l.settlement_account_number,
+       l.salary_account_number,
+       l.salary_account_name,
+       l.loan_code,
+       l.transfer_tracking_ref,
+       la.answers,
+       ls.first_name,
+       ls.last_name
+FROM loans l
+JOIN loan_answers la ON la.loan_id = l.id
+JOIN loan_sessions ls ON ls.id = l.session_id
+WHERE l.id = $1
+  `, [loanId]);
+    const updatedLoan = reload.rows[0];
+
+    const answers =
+      typeof updatedLoan.answers === "string"
+        ? JSON.parse(updatedLoan.answers)
+        : updatedLoan.answers || {};
+
+    /* =====================================================
+   GET APPROVED AMOUNT FROM APPROVAL TABLE
+===================================================== */
+
+const approvalRes = await client.query(`
+  SELECT approved_amount
+  FROM loan_approvals
+  WHERE loan_id = $1
+  AND approval_status = 'APPROVED'
+  AND approved_amount IS NOT NULL
+  ORDER BY approval_level DESC
+  LIMIT 1
+`, [loanId]);
+
+let loanAmount = null;
+
+if (approvalRes.rows.length) {
+  loanAmount = Number(approvalRes.rows[0].approved_amount);
+}
+
+/* fallback to application amount if not found */
+if (!loanAmount) {
+  const amountKey = Object.keys(answers)
+    .find(k => k.toLowerCase().includes("amount"));
+
+  loanAmount = Number(answers[amountKey]);
+}
+
+if (!loanAmount || isNaN(loanAmount) || loanAmount <= 0) {
+  throw new Error("Invalid loan amount detected before transfer");
+}
+
+console.log("💰 FINAL TRANSFER AMOUNT:", loanAmount);
+
+    if (!loanAmount || loanAmount <= 0) {
+      throw new Error("Invalid loan amount");
+    }
+
+    if (!updatedLoan.settlement_account_number) {
+      throw new Error("Settlement account missing before transfer");
+    }
+
+    if (!updatedLoan.salary_account_number) {
+      throw new Error("Salary account missing before transfer");
+    }
+
+
+// ✅ STOP HERE - NO TRANSFER YET
+await client.query("COMMIT");
+
+return {
+  success: true,
+  message: "Loan processed and disbursed to settlement account",
+  requiresTransfer: true
+};
+
+} catch (err) {
+  await client.query("ROLLBACK");
+  throw err;
+} finally {
+  client.release();
+}
+}
+
+/**
+ * ==================================================
+ * REJECT LOAN (FINAL)
+ * ==================================================
+ */
+static async rejectLoan({ loanId, approverId, reason, files = [] }) {
+
+ const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const loanRes = await client.query(
+  `SELECT status, crm_staff_id FROM loans WHERE id = $1 FOR UPDATE`,
+  [loanId]
+);
+
+if (!loanRes.rows.length) {
+  throw new Error("Loan not found");
+}
+
+const loan = loanRes.rows[0];
+
+if (loan.status !== "PENDING_REVIEW") {
+  throw new Error("Loan is no longer pending review");
+}
+
+if (loan.crm_staff_id === approverId) {
+  throw new Error("You cannot perform this action on a loan you created.");
+}
+
+
+   const cleanReason = reason?.trim();
+
+if (!cleanReason) {
+  throw new Error("Reason is required.");
+}
+
+    const approvalInsert = await client.query(
+  `
+  INSERT INTO loan_approvals
+  (loan_id, approver_id, approval_level, approval_status, approval_reason)
+  VALUES ($1, $2, 0, 'REJECTED', $3)
+  RETURNING id
+  `,
+ [loanId, approverId, cleanReason]
+);
+
+const approvalId = approvalInsert.rows[0].id;
+
+if (files?.length) {
+  for (const file of files) {
+  await client.query(
+    `
+    INSERT INTO loan_approval_files
+    (loan_id, approval_id, file_name, file_path, uploaded_by)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [
+      loanId,
+      approvalId,
+      file.originalname,
+      file.path,
+      approverId
+    ]
+  );
+}
+}
+
+    const oldStatus = loan.status;
+
+await client.query(
+  `
+  UPDATE loans
+  SET status = 'REJECTED',
+      rejected_at = NOW()
+  WHERE id = $1
+  `,
+  [loanId]
+);
+
+await LoanService.logLoanStatusChange(
+  {
+    loanId,
+    oldStatus,
+    newStatus: "REJECTED",
+    changedBy: approverId,
+    reason: cleanReason
+  },
+  client
+);
+
+   await client.query("COMMIT");
+
+    return { success: true };
+
+} catch (err) {
+  await client.query("ROLLBACK");
+
+  console.error("❌ LoanService Error:", {
+    message: err.message,
+    stack: err.stack,
+    loanId: loanId || null,
+    approverId: approverId || null,
+  });
+
+  throw err;
+} finally {
+  client.release();
+}
+
+}
+
+
+
+
+
+
+/**
+ * ==================================================
+ * PREVIEW CORE BANKING LOAN PAYLOAD
+ * ==================================================
+ */
+static async previewCoreLoanPayload(loanId) {
+
+const client = await pool.connect();
+
+try {
+
+const loanRes = await client.query(
+    `
+    SELECT
+      l.loan_code,
+      l.product_code,
+      la.answers,
+      ls.core_customer_id AS customer_id,
+      l.settlement_account_number
+    FROM loans l
+    JOIN loan_answers la ON la.loan_id = l.id
+    JOIN loan_sessions ls ON ls.id = l.session_id
+    WHERE l.id = $1
+    `,
+    [loanId]
+  );
+
+  if (!loanRes.rows.length) {
+    throw new Error("Loan not found");
+  }
+
+  const loan = loanRes.rows[0];
+
+  if (!loan.customer_id) {
+    throw new Error("Core customer ID missing. Cannot create loan.");
+  }
+
+  const answers =
+    typeof loan.answers === "string"
+      ? JSON.parse(loan.answers)
+      : loan.answers || {};
+
+  /* ================= VALIDATIONS ================= */
+
+  // 🔍 Detect amount dynamically
+const amountKey = Object.keys(answers).find(
+  key => key.toLowerCase().includes("amount")
+);
+
+const loanAmount = amountKey
+  ? Number(answers[amountKey])
+  : null;
+
+if (!loanAmount || loanAmount <= 0) {
+  throw new Error("Loan amount missing from application payload");
+}
+
+// 🔍 Detect tenure dynamically
+const tenureKey = Object.keys(answers).find(
+  key =>
+    key.toLowerCase().includes("tenure") ||
+    key.toLowerCase().includes("tenor")
+);
+
+const tenureValue = tenureKey
+  ? answers[tenureKey]
+  : null;
+
+if (!tenureValue) {
+  throw new Error("Loan tenure missing from application payload");
+}
+
+  
+
+  /* ================= RETURN CORE PAYLOAD ================= */
+
+return {
+  TransactionTrackingRef: loan.loan_code,
+  LoanProductCode: loan.product_code,
+  CustomerID: String(loan.customer_id),
+  LinkedAccountNumber: loan.settlement_account_number,
+
+  CollateralType:
+    answers.field_collateral_type ?? "SALARY",
+
+  CollateralDetails:
+    answers.field_collateral_details ??
+    "Salary-backed loan",
+
+  ComputationMode: "0",
+
+  Tenure: String(tenureValue),
+
+
+  Moratorium: String(
+    answers.field_moratorium ?? 0
+  ),
+
+  InterestAccrualCommencementDate:
+    new Date().toISOString().split("T")[0],
+
+ Amount: String(loanAmount),
+
+
+  InterestRate: String(
+    answers.field_interest_rate ?? 24
+  ),
+
+  PrincipalPaymentFrequency: "2",
+  InterestPaymentFrequency: "2",
+};
+
+} finally {
+  client.release();
+}
+}
+
+
+/**
+ * ==================================================
+ * GET PENDING LOAN APPROVALS
+ * ==================================================
+ */
+/**
+ * ==================================================
+ * GET PENDING LOAN APPROVALS
+ * ==================================================
+ */
+static async getPendingLoanApprovals(userRoleId) {
+
+const client = await pool.connect();
+
+try {
+
+const res = await client.query(`
+    SELECT
+      l.id,
+      l.loan_code,
+      l.product_code,
+      l.status,
+      l.created_at,
+
+      -- 🔥 MANDATE TRACKING
+      l.mandate_sent,
+      l.mandate_reference,
+      l.mandate_sent_at,
+
+      -- ================= RM =================
+      l.crm_staff_id,
+      CONCAT(
+        INITCAP(u.first_name),
+        ' ',
+        INITCAP(u.last_name)
+      ) AS rm_name,
+
+      -- ================= PRODUCT NAME =================
+      (ss.loan_settings->'productMeta'->l.product_code->>'name')
+        AS product_name,
+
+      -- ================= DIRECT DEBIT FLAG =================
+      COALESCE(
+        (ss.loan_settings->'productApprovals'->l.product_code->>'includeDirectDebit')::boolean,
+        false
+      ) AS include_direct_debit,
+
+      -- ================= SESSION INFO =================
+      ls.first_name,
+      ls.last_name,
+      ls.bvn,
+      ls.nin,
+      ls.core_customer_id,
+
+      -- ================= VERIFICATION =================
+      ls.verification_payload AS verification_payload,
+      ls.face_verification_payload AS face_payload,
+      ls.face_verification_status,
+      ls.face_match_score,
+      ls.face_verified_at,
+
+      -- ================= LOAN ANSWERS =================
+      la.answers AS application_payload,
+
+      -- ================= DOCUMENTS =================
+      COALESCE(
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'id', lsd.id,
+            'doc_type',
+              CASE
+                WHEN lsd.id IS NOT NULL THEN lsd.doc_type
+                ELSE 'ADMIN_ATTACHMENT'
+              END,
+            'file_path',
+              CASE
+                WHEN lsd.id IS NOT NULL THEN lsd.file_path
+                ELSE laf.file_path
+              END,
+            'uploaded_at',
+              CASE
+                WHEN lsd.id IS NOT NULL THEN lsd.uploaded_at
+                ELSE laf.created_at
+              END,
+            'status', lsd.status,
+            'admin_comment', lsd.admin_comment,
+            'reviewed_at', lsd.reviewed_at
+          )
+        ) FILTER (
+          WHERE lsd.id IS NOT NULL
+             OR laf.id IS NOT NULL
+        ),
+        '[]'
+      ) AS documents,
+
+      -- ================= APPROVAL HISTORY =================
+      COALESCE(
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'approval_id', lap.id,
+            'approval_status', lap.approval_status,
+            'approval_level', lap.approval_level,
+            'approval_reason', lap.approval_reason,
+            'created_at', lap.created_at,
+            'approver_name',
+              CONCAT(
+                INITCAP(ap.first_name),
+                ' ',
+                INITCAP(ap.last_name)
+              )
+          )
+        ) FILTER (WHERE lap.id IS NOT NULL),
+        '[]'
+      ) AS approval_history
+
+    FROM loans l
+
+    LEFT JOIN users u
+      ON u.id = l.crm_staff_id
+
+    LEFT JOIN system_settings ss
+      ON TRUE
+
+    LEFT JOIN loan_sessions ls
+      ON ls.id = l.session_id
+
+    LEFT JOIN loan_answers la
+      ON la.loan_id = l.id
+
+    LEFT JOIN loan_session_documents lsd
+      ON lsd.session_id = l.session_id
+
+    LEFT JOIN loan_approval_files laf
+      ON laf.loan_id = l.id
+
+    -- 🔥 NEW JOINS FOR APPROVALS
+    LEFT JOIN loan_approvals lap
+      ON lap.loan_id = l.id
+
+    LEFT JOIN users ap
+      ON ap.id = lap.approver_id
+
+    WHERE l.status IN (
+      'PENDING_REVIEW',
+      'RETURNED',
+      'REJECTED',
+      'APPROVED'
+    )
+
+    GROUP BY
+      l.id,
+      l.mandate_sent,
+      l.mandate_reference,
+      l.mandate_sent_at,
+      u.first_name,
+      u.last_name,
+      ss.loan_settings,
+      ls.id,
+      la.answers
+
+    ORDER BY l.created_at DESC
+  `);
+
+  const loanConfig = await LoanService.getLoanSettings();
+
+const normalized = res.rows
+
+.filter((loan) => {
+
+  // Super Admin should see ALL loans
+  if (Number(userRoleId) === 1) {
+    return true;
+  }
+
+  const productConfig =
+    loanConfig.productApprovals?.[loan.product_code];
+
+  if (!productConfig) return false;
+
+  const flow = productConfig.flow || [];
+
+  const approvalHistory = Array.isArray(loan.approval_history)
+    ? loan.approval_history
+    : [];
+
+  const approvedCount =
+    approvalHistory.filter(
+      (a) => a.approval_status === "APPROVED"
+    ).length;
+
+  const nextRole = flow[approvedCount];
+
+  return Number(nextRole) === Number(userRoleId);
+
+})
+  .map((loan) => {
+  const verification =
+    typeof loan.verification_payload === "string"
+      ? JSON.parse(loan.verification_payload)
+      : loan.verification_payload || {};
+
+  // ✅ ADD THIS BLOCK
+  let applicationPayload = loan.application_payload;
+
+  if (typeof applicationPayload === "string") {
+    try {
+      applicationPayload = JSON.parse(applicationPayload);
+    } catch (e) {
+      applicationPayload = {};
+    }
+  }
+
+  return {
+    ...loan,
+
+    // ✅ IMPORTANT: override with parsed payload
+    application_payload: applicationPayload,
+
+    include_direct_debit:
+      loan.include_direct_debit === true,
+
+      mandate_sent:
+        loan.mandate_sent === true,
+
+      mandate_reference:
+        loan.mandate_reference || null,
+
+      mandate_sent_at:
+        loan.mandate_sent_at || null,
+
+      approval_history:
+        Array.isArray(loan.approval_history)
+          ? loan.approval_history.sort(
+              (a, b) =>
+                new Date(a.created_at) -
+                new Date(b.created_at)
+            )
+          : [],
+
+      bvn_payload:
+        verification?.bvn || verification || null,
+
+      nin_payload:
+        verification?.nin || null,
+    };
+  });
+
+  return {
+  data: normalized,
+};
+
+} finally {
+  client.release();
+}
+}
+
+
+
+
+
+
+
+
+static async checkCoreCustomerByLoanId(loanId) {
+
+ 
+
+const client = await pool.connect();
+
+  try {
+    /* ================= GET LOAN + SESSION ================= */
+    const loanRes = await client.query(
+      `
+      SELECT
+        l.id,
+        l.product_code,
+        ls.id AS session_id,
+        ls.core_customer_id
+      FROM loans l
+      JOIN loan_sessions ls ON ls.id = l.session_id
+      WHERE l.id = $1
+      `,
+      [loanId]
+    );
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const loan = loanRes.rows[0];
+
+    /* ================= REQUIRE SAVED CORE ID ================= */
+    
+
+if (!loan.core_customer_id) {
+
+  console.log("🔍 No core_customer_id → searching by BVN...");
+
+  // 🔥 GET BVN FROM SESSION
+  const sessionRes = await client.query(`
+    SELECT bvn
+    FROM loan_sessions
+    WHERE id = $1
+  `, [loan.session_id]);
+
+  const bvn = sessionRes.rows[0]?.bvn;
+
+  if (!bvn) {
+    return {
+      success: true,
+      exists: false,
+      message: "BVN missing",
+    };
+  }
+
+  // 🔥 SEARCH CORE BY BVN
+  const bvnSearch = await coreBankingClient.get(
+    ENDPOINTS.CUSTOMER.GET_BY_BVN,
+    {
+      params: {
+        BVN: String(bvn),
+        institutionCode: INSTITUTION_CODE
+      }
+    }
+  );
+
+  const coreData = bvnSearch?.data;
+
+  if (!coreData || coreData.IsSuccessful === false) {
+    return {
+      success: true,
+      exists: false,
+      message: "Customer not found via BVN",
+    };
+  }
+
+  const customer = coreData?.Message || coreData;
+
+  const foundCustomerId =
+    customer.CustomerID ||
+    customer.customerID;
+
+  if (!foundCustomerId) {
+    return {
+      success: true,
+      exists: false,
+      message: "Customer ID not returned from BVN search",
+    };
+  }
+
+  console.log("✅ Found customer via BVN:", foundCustomerId);
+
+  // ✅ SAVE BACK TO DB
+  await client.query(`
+    UPDATE loan_sessions
+    SET core_customer_id = $2
+    WHERE id = $1
+  `, [loan.session_id, foundCustomerId]);
+
+  loan.core_customer_id = foundCustomerId;
+}
+
+    /* ================= VALIDATE CUSTOMER ================= */
+    let customerResponse;
+
+    try {
+      customerResponse = await coreBankingClient.get(
+        ENDPOINTS.CUSTOMER.GET_BY_ID,
+        {
+          params: {
+            CustomerID: String(loan.core_customer_id),
+          },
+        }
+      );
+    } catch (err) {
+      console.warn("Core validation failed:", err.message);
+
+      return {
+        success: true,
+        exists: false,
+        message: "Core validation failed",
+      };
+    }
+
+    const rawCustomer = customerResponse?.data;
+
+    if (!rawCustomer || rawCustomer.IsSuccessful === false) {
+      return {
+        success: true,
+        exists: false,
+        message: rawCustomer?.Message || "Customer not found in core",
+      };
+    }
+
+    const customer = rawCustomer?.Message || rawCustomer;
+
+    /* ================= FETCH ACCOUNTS ================= */
+    let accountsResponse;
+
+    try {
+      accountsResponse = await coreBankingClient.get(
+        ENDPOINTS.ACCOUNT.GET_BY_CUSTOMER_ID,
+        {
+          params: {
+            customerId: String(loan.core_customer_id),
+          },
+        }
+      );
+    } catch (err) {
+      console.warn("Account fetch failed:", err.message);
+
+      
+const customerExistsOnCore =
+  !!customer &&
+  !!(
+    customer.CustomerID ||
+    customer.customerID ||
+    customer.CustomerIDInString ||
+    customer.customerId
+  );
+
+return {
+  success: true,
+  exists: customerExistsOnCore,
+  customer: customerExistsOnCore ? customer : null,
+  accounts: [],
+  hasRequiredProduct: false,
+  settlementAccountWillBeCreated: true,
+  corePayload: customerExistsOnCore
+    ? { Message: customer }
+    : { Message: null },
+};
+    }
+
+
+    /* ================= NORMALIZE ACCOUNTS ================= */
+
+   
+const rawAccounts =
+  accountsResponse?.data?.Accounts ||
+  accountsResponse?.data?.Message?.Accounts || // ✅ FIX
+  accountsResponse?.data?.Message ||
+  accountsResponse?.Accounts ||
+  [];
+
+console.log("🔥 RAW ACCOUNT RESPONSE:");
+console.log(JSON.stringify(accountsResponse?.data, null, 2));
+
+   const accounts = rawAccounts.map((acc) => ({
+AccountNumber: acc.accountNumber || acc.AccountNumber,
+  AccountStatus: acc.accountStatus || acc.AccountStatus,
+  AccountType: acc.accountType || acc.AccountType,
+
+  AvailableBalance: acc.availableBalance || acc.AvailableBalance,
+  LedgerBalance: acc.ledgerBalance || acc.LedgerBalance,
+  WithdrawableAmount:
+    acc.withdrawableAmount || acc.WithdrawableAmount,
+
+  ProductCode: acc.productCode || acc.ProductCode,
+  Branch: acc.branch || acc.Branch,
+  KycLevel: acc.kycLevel || acc.KycLevel,
+
+  DateCreated: acc.dateCreated || acc.DateCreated,
+  LastActivityDate:
+    acc.lastActivityDate || acc.LastActivityDate,
+
+  NUBAN: acc.NUBAN,
+  CustomerID: acc.customerID || acc.CustomerID,
+  AccessLevel: acc.accessLevel || acc.AccessLevel,
+}));
+console.log("✅ NORMALIZED ACCOUNTS:", accounts);  
+
+/* ================= CHECK REQUIRED PRODUCT ================= */
+const loanConfig = await LoanService.getLoanSettings(client);
+
+
+const productConfig =
+  loanConfig.productApprovals?.[loan.product_code];
+
+const requiredProductCode =
+  productConfig?.accountOpeningProductCode;
+
+let hasRequiredProduct = false;
+
+if (requiredProductCode) {
+  hasRequiredProduct = accounts.some(
+    (acc) =>
+      String(acc.ProductCode) === String(requiredProductCode)
+  );
+}
+
+
+
+    /* ================= RETURN CLEAN RESPONSE ================= */
+ /* ================= RETURN CLEAN RESPONSE ================= */
+const customerExistsOnCore =
+  !!customer &&
+  !!(
+    customer.CustomerID ||
+    customer.customerID ||
+    customer.CustomerIDInString ||
+    customer.customerId
+  );
+
+return {
+  success: true,
+  exists: customerExistsOnCore,
+  customer: customerExistsOnCore ? customer : null,
+  accounts: customerExistsOnCore ? accounts : [],
+  hasRequiredProduct: customerExistsOnCore ? hasRequiredProduct : false,
+  settlementAccountWillBeCreated: customerExistsOnCore ? !hasRequiredProduct : true,
+  corePayload: customerExistsOnCore
+    ? {
+        Message: {
+          customer,
+          Accounts: accounts,
+        },
+      }
+    : {
+        Message: null,
+      },
+};
+  } catch (err) {
+    console.error("❌ checkCoreCustomerByLoanId Error:", err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+
+
+
+static async syncCoreCustomerToSession(loanId, coreData) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const loanRes = await client.query(
+      `SELECT session_id FROM loans WHERE id = $1`,
+      [loanId]
+    );
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found");
+    }
+
+    const sessionId = loanRes.rows[0].session_id;
+
+    await client.query(
+      `
+      UPDATE loan_sessions
+      SET core_customer_id = $2
+      WHERE id = $1
+      `,
+      [sessionId, coreData.customerID]
+    );
+
+    await client.query(
+      `
+      UPDATE loans
+      SET core_status = 'ACCOUNT_RESOLVED',
+          settlement_account_number = $2
+      WHERE id = $1
+      `,
+     [loanId, coreData.BankoneAccountNumber]
+    );
+
+    await client.query("COMMIT");
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+
+/* ======================================================
+   REJECT SINGLE DOCUMENT
+====================================================== */
+static async rejectDocument({
+  loanId,
+  documentId,
+  approverId,
+  reason
+}) {
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const cleanReason = reason?.trim();
+
+    if (!cleanReason) {
+      throw new Error("Rejection reason is required.");
+    }
+
+    /* =====================================================
+       🔒 Lock Loan First (prevent lifecycle conflicts)
+    ===================================================== */
+    const loanRes = await client.query(`
+      SELECT id, status, lifecycle_status, crm_staff_id
+      FROM loans
+      WHERE id = $1
+      FOR UPDATE
+    `, [loanId]);
+
+    if (!loanRes.rows.length) {
+      throw new Error("Loan not found.");
+    }
+
+    const loan = loanRes.rows[0];
+
+    // ❌ Cannot reject document after full processing
+    if (loan.lifecycle_status === "FULLY_PROCESSED") {
+      throw new Error(
+        "Cannot reject document. Loan already fully processed."
+      );
+    }
+
+    /* =====================================================
+       🔒 Lock Document Row (Only allow PENDING)
+    ===================================================== */
+    const docRes = await client.query(`
+      SELECT id, status
+      FROM loan_session_documents
+      WHERE id = $1
+      AND session_id = (
+        SELECT session_id FROM loans WHERE id = $2
+      )
+      AND COALESCE(status, 'PENDING') != 'APPROVED'
+      FOR UPDATE
+    `, [documentId, loanId]);
+
+    if (!docRes.rows.length) {
+      throw new Error(
+        "Document not found or cannot be rejected in current state."
+      );
+    }
+
+    const document = docRes.rows[0];
+
+    if (document.status === "REJECTED") {
+      throw new Error("Document is already rejected.");
+    }
+
+    /* =====================================================
+       ❌ Mark Document Rejected
+    ===================================================== */
+    await client.query(`
+      UPDATE loan_session_documents
+      SET status = 'REJECTED',
+          admin_comment = $2,
+          reviewed_by = $3,
+          reviewed_at = NOW()
+      WHERE id = $1
+    `, [documentId, cleanReason, approverId]);
+
+    /* =====================================================
+       🔥 Update Loan Lifecycle
+    ===================================================== */
+    await client.query(`
+   UPDATE loans
+SET lifecycle_status = 'BLOCKED_BY_DOCUMENT',
+    updated_at = NOW()
+WHERE id = $1
+    `, [loanId]);
+
+    /* =====================================================
+       🔔 Notify Relationship Manager
+    ===================================================== */
+    if (loan.crm_staff_id) {
+      await client.query(`
+        INSERT INTO notifications
+        (user_id, type, message, reference_id, created_at)
+        VALUES (
+          $1,
+          'DOCUMENT_REJECTED',
+          'A document was rejected. Please review and re-upload.',
+          $2,
+          NOW()
+        )
+      `, [loan.crm_staff_id, loanId]);
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      message: "Document rejected successfully."
+    };
+
+  } catch (err) {
+
+    await client.query("ROLLBACK");
+    console.error("❌ rejectDocument error:", err.message);
+    throw err;
+
+  } finally {
+    client.release();
+  }
+}
+
+
+/* ======================================================
+   APPROVE SINGLE DOCUMENT
+====================================================== */
+static async approveDocument({
+  loanId,
+  documentId,
+  approverId
+}) {
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    /* =====================================================
+       1️⃣ LOCK PENDING DOCUMENT
+    ===================================================== */
+    const docRes = await client.query(`
+      SELECT lsd.id, lsd.status, l.lifecycle_status
+      FROM loan_session_documents lsd
+      JOIN loans l ON l.session_id = lsd.session_id
+      WHERE l.id = $1
+      AND lsd.id = $2
+      AND lsd.status = 'PENDING'
+      FOR UPDATE
+    `, [loanId, documentId]);
+
+    if (!docRes.rows.length) {
+      throw new Error(
+        "Document not found or cannot be approved in current state."
+      );
+    }
+
+    const { lifecycle_status } = docRes.rows[0];
+
+    /* =====================================================
+       2️⃣ APPROVE DOCUMENT
+    ===================================================== */
+    await client.query(`
+      UPDATE loan_session_documents
+      SET status = 'APPROVED',
+          admin_comment = NULL,
+          reviewed_by = $2,
+          reviewed_at = NOW()
+      WHERE id = $1
+    `, [documentId, approverId]);
+
+    /* =====================================================
+       3️⃣ CHECK IF ANY REJECTED DOCUMENTS REMAIN
+    ===================================================== */
+    const rejectedCheck = await client.query(`
+      SELECT 1
+      FROM loan_session_documents lsd
+      JOIN loans l ON l.session_id = lsd.session_id
+      WHERE l.id = $1
+      AND lsd.status = 'REJECTED'
+      LIMIT 1
+    `, [loanId]);
+
+    /* =====================================================
+       4️⃣ RESTORE LIFECYCLE IF SAFE
+    ===================================================== */
+    if (
+      lifecycle_status === "BLOCKED_BY_DOCUMENT" &&
+      rejectedCheck.rows.length === 0
+    ) {
+      await client.query(`
+        UPDATE loans
+        SET lifecycle_status = 'INITIAL'
+        WHERE id = $1
+      `, [loanId]);
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      message: "Document approved successfully."
+    };
+
+  } catch (err) {
+
+    await client.query("ROLLBACK");
+    console.error("❌ approveDocument error:", err.message);
+    throw err;
+
+  } finally {
+    client.release();
+  }
+}
+
+
+
+/* ======================================================
+   RE-UPLOAD DOCUMENT (RM SIDE)
+====================================================== */
+/* ======================================================
+   RE-UPLOAD DOCUMENT (RM SIDE)
+====================================================== */
+/* ======================================================
+   RE-UPLOAD DOCUMENT (RM SIDE)
+   Only allowed when loan status = RETURNED
+====================================================== */
+/* ======================================================
+   RE-UPLOAD DOCUMENT (RM SIDE)
+   Only allowed when loan status = RETURNED
+====================================================== */
+static async reuploadDocument({
+  documentId,
+  filePath,
+  fileName
+}) {
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    /* =====================================================
+       1️⃣ LOCK DOCUMENT + LOAN
+    ===================================================== */
+    const docRes = await client.query(`
+      SELECT 
+        lsd.id,
+        lsd.status AS document_status,
+        l.id AS loan_id,
+        l.lifecycle_status,
+        l.status AS loan_status
+      FROM loan_session_documents lsd
+      JOIN loans l 
+        ON l.session_id = lsd.session_id
+      WHERE lsd.id = $1
+      FOR UPDATE
+    `, [documentId]);
+
+    if (!docRes.rows.length) {
+      throw new Error("Document not found.");
+    }
+
+    const document = docRes.rows[0];
+
+    /* =====================================================
+       2️⃣ STRICT BUSINESS RULE VALIDATION
+    ===================================================== */
+
+    // ❌ Prevent after full processing
+    if (document.lifecycle_status === "FULLY_PROCESSED") {
+      throw new Error(
+        "Cannot re-upload document. Loan already fully processed."
+      );
+    }
+
+    // 🔒 Only allow when loan is RETURNED
+    if (document.loan_status !== "RETURNED") {
+      throw new Error(
+        "Documents can only be replaced when loan is returned."
+      );
+    }
+
+    // 🔒 Only allow replacing rejected documents
+    if (document.document_status !== "REJECTED") {
+      throw new Error(
+        "Only rejected documents can be replaced."
+      );
+    }
+
+    /* =====================================================
+       3️⃣ UPDATE DOCUMENT (Reset to PENDING)
+    ===================================================== */
+    await client.query(`
+    UPDATE loan_session_documents
+SET file_path = $2,
+    status = 'PENDING',
+    admin_comment = NULL,
+    reviewed_by = NULL,
+    reviewed_at = NULL,
+    uploaded_at = NOW()
+WHERE id = $1
+    `, [documentId, filePath]);
+
+    /* =====================================================
+       4️⃣ CHECK IF ANY REJECTED DOCS REMAIN
+    ===================================================== */
+    const rejectedCheck = await client.query(`
+      SELECT 1
+      FROM loan_session_documents lsd
+      JOIN loans l ON l.session_id = lsd.session_id
+      WHERE l.id = $1
+      AND lsd.status = 'REJECTED'
+      LIMIT 1
+    `, [document.loan_id]);
+
+    /* =====================================================
+       5️⃣ IF ALL DOCUMENTS FIXED → RESTORE LOAN
+    ===================================================== */
+    if (rejectedCheck.rows.length === 0) {
+
+      // 🔥 Get current status for audit log
+      const statusRes = await client.query(
+        `SELECT status FROM loans WHERE id = $1`,
+        [document.loan_id]
+      );
+
+      const oldStatus = statusRes.rows[0]?.status;
+
+      // 🔥 Move loan back into approval flow
+      await client.query(`
+        UPDATE loans
+        SET lifecycle_status = 'INITIAL',
+            status = 'PENDING_REVIEW',
+            updated_at = NOW()
+        WHERE id = $1
+      `, [document.loan_id]);
+
+      // 🔥 Log status change
+      await LoanService.logLoanStatusChange(
+        {
+          loanId: document.loan_id,
+          oldStatus,
+          newStatus: "PENDING_REVIEW",
+          changedBy: null, // RM action (optional: pass RM ID if available)
+          reason: "All rejected documents replaced"
+        },
+        client
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      message: "Document replaced and resubmitted for review."
+    };
+
+  } catch (err) {
+
+    await client.query("ROLLBACK");
+    console.error("❌ reuploadDocument error:", err.message);
+    throw err;
+
+  } finally {
+    client.release();
+  }
+}
+
+/* ======================================================
+   GET LOANS FOR LOGGED-IN RM
+====================================================== */
+/* ======================================================
+   GET LOANS FOR LOGGED-IN RM (WITH DOCUMENTS)
+====================================================== */
+static async getLoansByRmId(rmId) {
+
+const client = await pool.connect();
+
+try {
+
+  const loanConfig = await LoanService.getLoanSettings();
+  const res = await client.query(`
+    SELECT
+      l.id,
+      l.loan_code,
+      l.status,
+      l.product_code,
+      l.created_at,
+      l.updated_at,
+      l.returned_at,
+      l.rejected_at,
+      l.approved_at,
+      l.lifecycle_status,
+      l.disbursement_status,
+
+      ls.first_name,
+      ls.last_name,
+
+      la.answers,
+
+      /* ================= DOCUMENTS ================= */
+      COALESCE(
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'id', lsd.id,
+            'doc_type', lsd.doc_type,
+            'file_path', lsd.file_path,
+
+            /* 🔥 derive filename from path safely */
+            'file_name',
+              CASE
+                WHEN lsd.file_path IS NOT NULL THEN
+                  split_part(
+                    lsd.file_path,
+                    '/',
+                    array_length(string_to_array(lsd.file_path, '/'), 1)
+                  )
+                ELSE NULL
+              END,
+
+            'status', COALESCE(lsd.status, 'PENDING'),
+            'admin_comment', lsd.admin_comment,
+            'reviewed_at', lsd.reviewed_at,
+            'uploaded_at', lsd.uploaded_at
+          )
+        ) FILTER (WHERE lsd.id IS NOT NULL),
+        '[]'
+      ) AS documents,
+
+      /* ================= APPROVAL HISTORY ================= */
+      COALESCE(
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'approval_id', lap.id,
+            'approval_status', lap.approval_status,
+            'approval_level', lap.approval_level,
+            'approval_reason', lap.approval_reason,
+            'created_at', lap.created_at,
+            'approver_name',
+              CONCAT(
+                INITCAP(u.first_name),
+                ' ',
+                INITCAP(u.last_name)
+              )
+          )
+        ) FILTER (WHERE lap.id IS NOT NULL),
+        '[]'
+      ) AS approval_history,
+
+      COALESCE(
+        (
+          SELECT MAX(approval_level)
+          FROM loan_approvals
+          WHERE loan_id = l.id
+          AND approval_status = 'APPROVED'
+        ),
+        0
+      ) AS current_level
+
+    FROM loans l
+
+    JOIN loan_sessions ls
+      ON ls.id = l.session_id
+
+    LEFT JOIN loan_answers la
+      ON la.loan_id = l.id
+
+    LEFT JOIN loan_session_documents lsd
+      ON lsd.session_id = l.session_id
+
+    LEFT JOIN loan_approvals lap
+      ON lap.loan_id = l.id
+
+    LEFT JOIN users u
+      ON u.id = lap.approver_id
+
+    WHERE l.crm_staff_id = $1
+
+    GROUP BY
+      l.id,
+      ls.id,
+      la.answers
+
+    ORDER BY l.created_at DESC
+  `, [rmId]);
+
+  const loans = res.rows.map(row => {
+
+    const productConfig =
+      loanConfig.productApprovals?.[row.product_code] || {};
+
+    const flow = productConfig.flow || [];
+    const totalLevels = flow.length;
+    const currentLevel = Number(row.current_level || 0);
+
+    const isFullyApproved =
+      totalLevels > 0 &&
+      currentLevel >= totalLevels;
+
+    const nextRoleId =
+      !isFullyApproved
+        ? flow[currentLevel]
+        : null;
+
+    const answers =
+      typeof row.answers === "string"
+        ? JSON.parse(row.answers)
+        : row.answers || {};
+
+    const amountKey = Object.keys(answers)
+      .find(k => k.toLowerCase().includes("amount"));
+
+    const approvalPercentage =
+      totalLevels > 0
+        ? Math.round((currentLevel / totalLevels) * 100)
+        : 0;
+
+    const progressLabel =
+      `${currentLevel}/${totalLevels}`;
+
+    const approvalFlow = flow.map((roleId, index) => {
+      const role = loanConfig.roles?.find(
+        r => String(r.id) === String(roleId)
+      );
+
+      return {
+        level: index + 1,
+        role_id: roleId,
+        role_name: role?.name || `Level ${index + 1}`,
+        completed: currentLevel > index,
+        current: currentLevel === index
+      };
+    });
+
+    let slaDeadline = null;
+    let slaExpired = false;
+
+    if (!isFullyApproved && row.status === "PENDING_REVIEW") {
+
+      const slaHours =
+        productConfig.slaHoursPerLevel || 24;
+
+      const approvedHistory =
+        Array.isArray(row.approval_history)
+          ? row.approval_history
+              .filter(a => a.approval_status === "APPROVED")
+              .sort(
+                (a, b) =>
+                  new Date(a.created_at) -
+                  new Date(b.created_at)
+              )
+          : [];
+
+      const lastApproval =
+        approvedHistory.length
+          ? approvedHistory[approvedHistory.length - 1]
+          : null;
+
+      const baseTime =
+        lastApproval?.created_at || row.created_at;
+
+      const deadline = new Date(baseTime);
+      deadline.setHours(deadline.getHours() + slaHours);
+
+      slaDeadline = deadline;
+      slaExpired = new Date() > deadline;
+    }
+
+    let pendingWith = null;
+
+    if (row.status === "PENDING_REVIEW" && !isFullyApproved) {
+
+      const role = loanConfig.roles?.find(
+        r => String(r.id) === String(nextRoleId)
+      );
+
+      pendingWith =
+        role?.name ||
+        `Level ${currentLevel + 1}`;
+    }
+
+    if (row.status === "RETURNED") {
+      pendingWith = "Relationship Manager";
+    }
+
+    if (row.status === "REJECTED") {
+      pendingWith = null;
+    }
+
+    if (isFullyApproved &&
+        row.disbursement_status !== "COMPLETED") {
+      pendingWith = "Disbursement";
+    }
+
+    if (row.disbursement_status === "COMPLETED") {
+      pendingWith = null;
+    }
+
+    return {
+      id: row.id,
+      loan_code: row.loan_code,
+      status: row.status,
+      lifecycle_status: row.lifecycle_status,
+      disbursement_status: row.disbursement_status,
+      product_code: row.product_code,
+
+      product_name:
+        loanConfig.productMeta?.[row.product_code]?.name ||
+        row.product_code,
+
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      approved_at: row.approved_at,
+      rejected_at: row.rejected_at,
+      returned_at: row.returned_at,
+
+      approval_history:
+        Array.isArray(row.approval_history)
+          ? row.approval_history.sort(
+              (a, b) =>
+                new Date(a.created_at) -
+                new Date(b.created_at)
+            )
+          : [],
+
+      documents:
+        Array.isArray(row.documents)
+          ? row.documents
+          : [],
+
+      total_levels: totalLevels,
+      current_level: currentLevel,
+      next_level: nextRoleId,
+      is_fully_approved: isFullyApproved,
+      approval_percentage: approvalPercentage,
+      approval_progress_label: progressLabel,
+      approval_flow: approvalFlow,
+      pending_with: pendingWith,
+
+      sla_deadline: slaDeadline,
+      sla_expired: slaExpired,
+
+      customer_name:
+        `${row.first_name} ${row.last_name}`,
+
+      amount:
+        amountKey ? Number(answers[amountKey]) : 0
+    };
+  });
+
+ return {
+  success: true,
+  data: loans
+};
+
+} catch (err) {
+
+  console.error("❌ getLoansByRmId error:", err.message);
+  throw err;
+
+} finally {
+
+  client.release();
+
+}
+}
+
+
+
+static async logLoanStatusChange(
+  { loanId, oldStatus, newStatus, changedBy, reason = null },
+  client
+) {
+  await client.query(
+    `
+    INSERT INTO loan_status_history
+    (loan_id, old_status, new_status, changed_by, change_reason)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [loanId, oldStatus, newStatus, changedBy, reason]
+  );
+}
+
+
+
+/* ======================================================
+   GET LOAN TRANSFERS (WITH FILTERS)
+====================================================== */
+static async getLoanTransfers({
+  status = null,
+  manualFunding = false,
+  fromDate = null,
+  toDate = null
+} = {}) {
+
+const client = await pool.connect();
+
+try {
+
+  const values = [];
+  let whereConditions = [`lfe.event_type = 'TRANSFER'`];
+
+  if (status) {
+    values.push(status);
+    whereConditions.push(`lfe.status = $${values.length}`);
+  }
+
+  if (manualFunding === true) {
+    whereConditions.push(`l.disbursement_status = 'AWAITING_MANUAL_FUNDING'`);
+  }
+
+  if (fromDate) {
+    values.push(fromDate);
+    whereConditions.push(`lfe.created_at >= $${values.length}`);
+  }
+
+  if (toDate) {
+    values.push(toDate);
+    whereConditions.push(`lfe.created_at <= $${values.length}`);
+  }
+
+  const whereClause =
+    whereConditions.length
+      ? `WHERE ${whereConditions.join(" AND ")}`
+      : "";
+
+  const res = await client.query(`
+    SELECT
+      lfe.id,
+      lfe.loan_id,
+      lfe.reference,
+      lfe.amount,
+      lfe.status,
+      lfe.created_at,
+      lfe.core_response,
+      l.loan_code,
+      l.product_code,
+      l.disbursement_status,
+      l.lifecycle_status,
+      CONCAT(ls.first_name, ' ', ls.last_name) AS customer_name
+    FROM loan_financial_events lfe
+    JOIN loans l ON l.id = lfe.loan_id
+    JOIN loan_sessions ls ON ls.id = l.session_id
+    ${whereClause}
+    ORDER BY lfe.created_at DESC
+  `, values);
+
+  return {
+    success: true,
+    count: res.rows.length,
+    data: res.rows
+  };
+
+} finally {
+  client.release();
+}
+}
+}
+module.exports = LoanService;

@@ -1,0 +1,286 @@
+const axios = require("axios");
+const crypto = require("crypto");
+const prisma = require("../lib/prisma");
+const { sendStyledMail } = require("../../mailer");
+
+const PAYSTACK_BASE = "https://api.paystack.co";
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+
+/* =====================================================
+   INITIATE DIRECT DEBIT MANDATE
+===================================================== */
+exports.initializeDirectDebitMandate = async (req, res) => {
+  try {
+    const initiatorEmail = req.session?.user?.email || null;
+    const { email } = req.body;
+
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer email is required",
+      });
+    }
+
+    const response = await axios.post(
+      `${PAYSTACK_BASE}/customer/authorization/initialize`,
+      {
+        channel: "direct_debit",
+        email,
+        callback_url: `${process.env.APP_URL}/api/paystack/direct-debit/callback`,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const { redirect_url, reference } = response.data.data;
+
+    await prisma.direct_debit_mandates.create({
+      data: {
+        customer_email: email,
+        reference,
+        status: "PENDING",
+        loan_id: req.body.loanId || null,
+        initiated_by: initiatorEmail,
+      },
+    });
+
+    // 📧 Customer email
+    await sendStyledMail({
+      to: email,
+      subject: "Authorize Direct Debit Mandate",
+      title: "Direct Debit Authorization Required",
+      body: `
+        <p>Please authorize direct debit for repayments.</p>
+        <a href="${redirect_url}" target="_blank">Authorize Now</a>
+      `,
+    });
+
+    // 📧 Admin email
+    if (initiatorEmail) {
+      await sendStyledMail({
+        to: initiatorEmail,
+        subject: "Mandate Sent",
+        title: "Direct Debit Initiated",
+        body: `<p>Mandate sent to ${email}</p>`,
+      });
+    }
+
+    return res.json({ success: true, redirect_url, reference });
+
+  } catch (err) {
+    console.error("❌ INIT ERROR:", err.message);
+    return res.status(500).json({ success: false });
+  }
+};
+
+/* =====================================================
+   CALLBACK
+===================================================== */
+exports.handleDirectDebitCallback = async (req, res) => {
+  const { reference } = req.query;
+
+  return res.redirect(
+    `${process.env.FRONTEND_URL}/wallet/direct-debit?reference=${reference || ""}`
+  );
+};
+
+/* =====================================================
+   STATUS CHECK
+===================================================== */
+exports.getDirectDebitStatus = async (req, res) => {
+  const { reference } = req.query;
+
+  const mandate = await prisma.direct_debit_mandates.findUnique({
+    where: { reference },
+  });
+
+  if (!mandate) return res.json({ status: "NOT_FOUND" });
+
+  return res.json({ status: mandate.status });
+};
+
+/* =====================================================
+   CHARGE DIRECT DEBIT (MANUAL / CRON)
+===================================================== */
+exports.chargeDirectDebit = async (req, res) => {
+  try {
+    const { email, amount, user_id } = req.body;
+
+    const mandate = await prisma.direct_debit_mandates.findFirst({
+      where: { customer_email: email, status: "ACTIVE" },
+      orderBy: { created_at: "desc" },
+    });
+
+    if (!mandate || !mandate.authorization_code) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid mandate",
+      });
+    }
+
+    const reference = `DD-${Date.now()}`;
+
+    await axios.post(
+      `${PAYSTACK_BASE}/transaction/charge_authorization`,
+      {
+        authorization_code: mandate.authorization_code,
+        email,
+        amount: amount * 100,
+        reference,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+        },
+      }
+    );
+
+    await prisma.wallet_transactions.create({
+      data: {
+        user_id,
+        amount,
+        reference,
+        status: "PENDING",
+        channel: "DIRECT_DEBIT",
+        type: "CREDIT",
+      },
+    });
+
+    return res.json({ success: true, reference });
+
+  } catch (err) {
+    console.error("❌ CHARGE ERROR:", err.message);
+    return res.status(500).json({ success: false });
+  }
+};
+
+/* =====================================================
+   PAYSTACK WEBHOOK
+===================================================== */
+exports.handleDirectDebitWebhook = async (req, res) => {
+  try {
+    const signature = req.headers["x-paystack-signature"];
+
+    if (!signature) return res.sendStatus(401);
+
+    const hash = crypto
+      .createHmac("sha512", PAYSTACK_SECRET)
+      .update(req.body)
+      .digest("hex");
+
+    if (hash !== signature) return res.sendStatus(401);
+
+    const event = JSON.parse(req.body.toString());
+    const data = event?.data;
+
+    if (!data) return res.sendStatus(200);
+
+    console.log("📩 EVENT:", event.event);
+
+    /* ================= SAVE AUTHORIZATION ================= */
+    if (event.event === "charge.success") {
+      const auth = data.authorization;
+
+      if (auth?.authorization_code && auth.reusable) {
+        await prisma.direct_debit_mandates.updateMany({
+          where: { customer_email: data.customer?.email }, // ✅ SAFE MATCH
+          data: {
+            authorization_code: auth.authorization_code,
+            status: "ACTIVE",
+          },
+        });
+
+        console.log("✅ Saved authorization_code:", auth.authorization_code);
+      }
+    }
+
+    /* ================= MANDATE ACTIVATED ================= */
+    if (event.event === "direct_debit.authorization.active") {
+
+      const mandate = await prisma.direct_debit_mandates.findFirst({
+        where: { reference: data.reference },
+      });
+
+      if (!mandate || mandate.status === "ACTIVE") {
+        return res.sendStatus(200);
+      }
+
+      await prisma.direct_debit_mandates.updateMany({
+        where: { reference: data.reference },
+        data: {
+          status: "ACTIVE",
+          authorization_code: data.authorization_code,
+        },
+      });
+
+      const email = data.customer?.email || mandate.customer_email;
+
+      if (email) {
+        await sendStyledMail({
+          to: email,
+          subject: "Mandate Activated",
+          title: "Direct Debit Active",
+          body: `<p>Your mandate is active.</p>`,
+        });
+      }
+
+      await sendStyledMail({
+        to: [
+          mandate?.initiated_by,
+          "ict@mutualtrustmfbank.com",
+          "credept@mutualtrustmfbank.com",
+        ].filter(Boolean),
+        subject: "Mandate Activated",
+        title: "Customer Activated",
+        body: `<p>${email} activated mandate</p>`,
+      });
+    }
+
+    /* ================= CHARGE SUCCESS ================= */
+    if (event.event === "charge.success") {
+      const { reference, amount } = data;
+
+      const tx = await prisma.wallet_transactions.findUnique({
+        where: { reference },
+      });
+
+      if (tx && tx.status !== "SUCCESS") {
+        await prisma.$transaction([
+          prisma.wallet_transactions.update({
+            where: { reference },
+            data: { status: "SUCCESS" },
+          }),
+          prisma.wallets.update({
+            where: { user_id: tx.user_id },
+            data: { balance: { increment: amount / 100 } },
+          }),
+        ]);
+
+        const email = data.customer?.email;
+
+        if (email) {
+          await sendStyledMail({
+            to: email,
+            subject: "Payment Successful",
+            title: "Debit Successful",
+            body: `
+              <p>Amount: ₦${amount / 100}</p>
+              <p>Reference: ${reference}</p>
+            `,
+          });
+        }
+      }
+    }
+
+    return res.sendStatus(200);
+
+  } catch (err) {
+    console.error("🔥 WEBHOOK ERROR:", err.message);
+    return res.sendStatus(200);
+  }
+};

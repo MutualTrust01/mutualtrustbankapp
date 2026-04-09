@@ -1,0 +1,160 @@
+import express from "express";
+import axios from "axios";
+import redisClient from "../utils/redisClient.js";
+
+const router = express.Router();
+const pool = require("../../db");
+
+const TRANSFER_TOKEN = process.env.TRANSFER_TOKEN;
+
+/* ======================================================
+   VERIFY ACCOUNT
+====================================================== */
+
+router.post("/verify-account", async (req, res) => {
+
+  try {
+
+    let { accountNumber, bankCode } = req.body;
+
+    accountNumber = String(accountNumber || "").trim();
+    bankCode = String(bankCode || "").trim();
+
+    if (!accountNumber || accountNumber.length !== 10) {
+      return res.status(400).json({
+        success:false,
+        message:"Invalid account number"
+      });
+    }
+
+    if (!bankCode) {
+      return res.status(400).json({
+        success:false,
+        message:"Bank code required"
+      });
+    }
+
+    const redisKey = `acct:${accountNumber}:${bankCode}`;
+
+    /* ======================================================
+       REDIS CACHE
+    ====================================================== */
+
+    try {
+
+      const redisCache = await redisClient.get(redisKey);
+
+      if (redisCache) {
+
+        console.log("⚡ Redis cache hit:", accountNumber);
+
+        return res.json(JSON.parse(redisCache));
+
+      }
+
+    } catch (err) {
+      console.log("Redis unavailable");
+    }
+
+    /* ======================================================
+       POSTGRES CACHE
+    ====================================================== */
+
+    const cached = await pool.query(
+      `SELECT * FROM account_verification_cache
+       WHERE account_number=$1 AND bank_code=$2`,
+      [accountNumber, bankCode]
+    );
+
+    if (cached.rows.length > 0) {
+
+      const row = cached.rows[0];
+
+     
+const result = {
+  success: true,
+  bankCode: row.bank_code,
+  bankName: row.bank_name || null,
+  accountName: row.account_name
+};
+
+      try {
+        await redisClient.set(redisKey, JSON.stringify(result), { EX:86400 });
+      } catch (err) {}
+
+      console.log("⚡ PostgreSQL cache hit");
+
+      return res.json(result);
+    }
+
+    console.log("CACHE MISS → verifying account");
+
+    /* ======================================================
+       CALL BANKONE API
+    ====================================================== */
+
+    const response = await axios.post(
+      "https://api.mybankone.com/BankOneWebAPI/api/Transfer/NameEnquiry",
+      {
+        AccountNumber: accountNumber,
+        BankCode: bankCode
+      },
+      {
+        params:{ authtoken:TRANSFER_TOKEN },
+        timeout:7000
+      }
+    );
+
+    const data = response.data;
+
+    if (data?.IsSuccessful && data?.Name) {
+
+      
+      console.log("🔥 Account verified:", data.Name);
+
+      /* ======================================================
+         SAVE TO POSTGRES
+      ====================================================== */
+
+      await pool.query(
+        `INSERT INTO account_verification_cache
+         (account_number, bank_code, account_name)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (account_number, bank_code) DO NOTHING`,
+        [
+          accountNumber,
+          bankCode,
+          data.Name
+        ]
+      );
+
+      /* ======================================================
+         SAVE TO REDIS
+      ====================================================== */
+
+      try {
+        await redisClient.set(redisKey, JSON.stringify(result), { EX:86400 });
+      } catch (err) {}
+
+      return res.json(result);
+    }
+
+    return res.json({
+      success:false,
+      message:"Account not found"
+    });
+
+  } catch (err) {
+
+    console.error("Verification error:", err.message);
+
+    return res.status(500).json({
+      success:false,
+      message:"Verification failed"
+    });
+
+  }
+
+});
+
+export default router;

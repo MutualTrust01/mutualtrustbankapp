@@ -1,0 +1,226 @@
+const https = require("https");
+const cron = require("node-cron");
+const pool = require("../../db");
+
+/* ================= CONFIG ================= */
+const CORE_HOST = "api.mybankone.com";
+const CORE_TOKEN = "d5ed1ddd-5cf4-4a8b-8977-2d854bfd07e6";
+const BANKONE_MFB_CODE = "0254";
+
+/* ================= FETCH ================= */
+
+const fetchFromCore = (path) => {
+  return new Promise((resolve, reject) => {
+    const options = {
+      method: "GET",
+      hostname: CORE_HOST,
+      path,
+      headers: {
+        accept: "application/json",
+        Authorization: `Bearer ${CORE_TOKEN}`,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      const chunks = [];
+
+      res.on("data", (chunk) => chunks.push(chunk));
+
+      res.on("end", () => {
+        const body = Buffer.concat(chunks).toString();
+
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          reject(body);
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+};
+
+/* ================= HELPERS ================= */
+
+const normalize = (str) => {
+  return (str || "")
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ") // remove symbols
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+
+const splitNames = (name) => {
+  return normalize(name).split(" ").filter(Boolean);
+};
+
+/* ================= SYNC ================= */
+
+async function syncAccountOfficers() {
+  console.log("\n🔍 Syncing Account Officers...");
+
+  let coreList = [];
+
+  try {
+    for (let i = 0; i <= 50; i++) {
+      const path = `/BankOneWebAPI/api/AccountOfficer/Get/${i}?mfbCode=${BANKONE_MFB_CODE}`;
+
+      console.log("🌐 FETCHING:", path);
+
+      const data = await fetchFromCore(path);
+
+      if (!Array.isArray(data) || data.length === 0) {
+        console.log("⛔ No more data, stopping at page:", i);
+        break;
+      }
+
+      coreList = coreList.concat(data);
+    }
+
+    console.log(`📦 Total fetched: ${coreList.length}`);
+  } catch (err) {
+    console.log("❌ FETCH ERROR:", err);
+    return;
+  }
+
+  let inserted = 0;
+
+  for (const officer of coreList) {
+    try {
+      if (!officer.Name || !officer.Code) continue;
+
+      const name = normalize(officer.Name);
+      const code = officer.Code.trim();
+
+      await pool.query(
+        `
+        INSERT INTO core_account_officers (name, display_code)
+        VALUES ($1, $2)
+        ON CONFLICT (display_code)
+        DO UPDATE SET name = EXCLUDED.name
+      `,
+        [name, code]
+      );
+
+      inserted++;
+    } catch (err) {
+      console.log("❌ SAVE ERROR:", err.message);
+    }
+  }
+
+  console.log(`✅ Core staff saved locally (${inserted})`);
+}
+
+/* ================= SMART NAME MATCHING ================= */
+
+const isMatch = (staffParts, officerParts) => {
+  let matches = [];
+
+  for (const s of staffParts) {
+    for (const o of officerParts) {
+      if (s === o) {
+        matches.push(s);
+      }
+    }
+  }
+
+  // ✅ strong match (rare names)
+  if (matches.length >= 2) return true;
+
+  // ✅ allow 1 strong match if name is long/unique
+  if (matches.length === 1) {
+    const word = matches[0];
+
+    // ignore very short/common names
+    if (word.length > 4) return true;
+  }
+
+  return false;
+};
+
+async function mapByNameSmart() {
+  console.log("\n🧠 Smart Name Mapping...");
+
+  try {
+    const officers = await pool.query(`
+      SELECT id, name, display_code
+FROM core_account_officers
+WHERE resolved IS NOT TRUE
+    `);
+
+    const staffList = await pool.query(`
+      SELECT id, first_name, last_name 
+FROM users
+WHERE core_staff_code IS NULL
+    `);
+
+    for (const officer of officers.rows) {
+      const officerParts = splitNames(officer.name);
+
+      let matchedStaff = null;
+
+      for (const staff of staffList.rows) {
+        const staffFullName = `${staff.first_name} ${staff.last_name}`;
+        const staffParts = splitNames(staffFullName);
+
+        if (isMatch(staffParts, officerParts)) {
+          matchedStaff = staff;
+          break;
+        }
+      }
+
+      if (!matchedStaff) {
+        console.log(`❌ No match for: ${officer.name}`);
+        continue;
+      }
+
+      await pool.query(
+        `
+        UPDATE users
+        SET core_staff_code = $1
+        WHERE id = $2
+      `,
+        [officer.display_code, matchedStaff.id]
+      );
+await pool.query(`
+  UPDATE core_account_officers
+  SET resolved = true
+  WHERE id = $1
+`, [officer.id]);
+      console.log(`✅ MATCHED → ${officer.name} → user ${matchedStaff.id}`);
+    }
+
+    console.log("🎉 Smart mapping completed");
+  } catch (err) {
+    console.error("❌ Smart mapping error:", err.message);
+  }
+}
+
+/* ================= CRONS ================= */
+
+cron.schedule("*/10 * * * *", async () => {
+  console.log("\n👤 Cron: Sync Account Officers...");
+  await syncAccountOfficers();
+});
+
+cron.schedule("*/15 * * * *", async () => {
+  console.log("\n🧠 Cron: Smart Name Matching...");
+  await mapByNameSmart();
+});
+
+/* ================= MANUAL TEST ================= */
+
+if (require.main === module) {
+  (async () => {
+    console.log("\n🚀 Running manual test...\n");
+
+    await syncAccountOfficers();
+    await mapByNameSmart();
+
+    console.log("\n✅ Manual run complete\n");
+    process.exit();
+  })();
+}

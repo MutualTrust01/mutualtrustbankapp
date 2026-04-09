@@ -1,0 +1,454 @@
+// FULL RESTORED PAYSLIP CONTROLLER (ALL FUNCTIONS + SAFE SQL FIX)
+
+const xlsx = require("xlsx");
+const fs = require("fs");
+const prisma = require("../../prisma/client");
+const { sendProgress, getProgress } = require("../utils/payslipProgress");
+const axios = require("axios");
+
+console.log("🔥 Controller reached");
+
+const safeProgress = (uploadId, payload) => {
+  try {
+    sendProgress(uploadId, payload);
+  } catch (err) {
+    console.warn("⚠️ Progress update failed:", err.message);
+  }
+};
+
+const detectValue = (row, aliases) => {
+  const normalize = (k) =>
+    String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  const normalizedAliases = aliases.map(normalize);
+
+  for (const key of Object.keys(row)) {
+    const normKey = normalize(key);
+
+    if (normalizedAliases.includes(normKey)) {
+      return row[key];
+    }
+  }
+
+  return null;
+};
+
+/* =====================================================
+   UPLOAD PAYSLIP (FIXED)
+===================================================== */
+exports.uploadPayslip = async (req, res) => {
+  const { uploadId, uploadMonth } = req.body;
+
+  if (!uploadId) {
+    return res.status(400).json({ message: "Missing uploadId" });
+  }
+
+  safeProgress(uploadId, {
+    success: true,
+    progress: 0,
+    status: "starting",
+    message: "Upload started"
+  });
+
+  try {
+    if (!req.file) {
+      safeProgress(uploadId, {
+        success: false,
+        progress: 0,
+        status: "failed",
+        message: "No file uploaded"
+      });
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
+    if (!uploadMonth || !/^\d{4}-\d{2}$/.test(uploadMonth)) {
+      safeProgress(uploadId, {
+        success: false,
+        progress: 0,
+        status: "failed",
+        message: "Invalid uploadMonth"
+      });
+      return res.status(400).json({ message: "Invalid uploadMonth" });
+    }
+
+    safeProgress(uploadId, {
+      success: true,
+      progress: 10,
+      status: "reading_file",
+      message: "Reading uploaded file"
+    });
+
+    const workbook = xlsx.readFile(req.file.path);
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rawRows = xlsx.utils.sheet_to_json(sheet, { defval: "" });
+
+    if (!rawRows.length) {
+      safeProgress(uploadId, {
+        success: false,
+        progress: 0,
+        status: "failed",
+        message: "Empty file"
+      });
+      return res.status(400).json({ message: "Empty file" });
+    }
+
+    safeProgress(uploadId, {
+      success: true,
+      progress: 25,
+      status: "processing_rows",
+      message: "Processing payslip rows"
+    });
+
+    const normalizeKey = (k) =>
+      String(k)
+        .toLowerCase()
+        .replace(/\s+/g, "_")
+        .replace(/[^a-z0-9_]/g, "");
+
+    const rows = rawRows.map((r) => {
+      const o = {};
+      for (const k in r) o[normalizeKey(k)] = r[k];
+      return o;
+    });
+
+    const ippisKey = ["ippis_no", "ippis_number", "ippis"].find(
+      (k) => k in rows[0]
+    );
+
+    if (!ippisKey) {
+      safeProgress(uploadId, {
+        success: false,
+        progress: 0,
+        status: "failed",
+        message: "IPPIS column missing"
+      });
+      return res.status(400).json({ message: "IPPIS column missing" });
+    }
+
+    safeProgress(uploadId, {
+      success: true,
+      progress: 40,
+      status: "saving_records",
+      message: "Saving payslip records"
+    });
+
+    await prisma.PayslipRecord.deleteMany({
+      where: { upload_month: uploadMonth }
+    });
+
+    await prisma.PayslipRecord.createMany({
+      data: rows.map((r) => ({
+        ippis_number: String(r[ippisKey]).toUpperCase(),
+        upload_month: uploadMonth,
+        data: r
+      })),
+      skipDuplicates: true
+    });
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const ippis = String(row[ippisKey]).toUpperCase();
+
+      const percent = Math.min(
+        90,
+        50 + Math.floor(((i + 1) / rows.length) * 40)
+      );
+
+      safeProgress(uploadId, {
+        success: true,
+        progress: percent,
+        status: "saving_customers",
+        message: `Processing row ${i + 1} of ${rows.length}`
+      });
+
+      let accountNumber =
+        row.acc_no ||
+        row.accountno ||
+        row.account_number ||
+        row.salary_account ||
+        row.salaryaccount ||
+        null;
+
+      accountNumber = accountNumber
+        ? String(accountNumber).replace(/\D/g, "")
+        : null;
+
+      if (!accountNumber || accountNumber.length < 10) continue;
+
+      const bankName =
+        detectValue(row, ["bank", "bank_name"]) || "UNKNOWN";
+      const organisation =
+        detectValue(row, ["organisation", "ministry", "agency"]) || "UNKNOWN";
+      const salary = Number(
+        detectValue(row, ["salary", "gross_salary"]) || 0
+      );
+      const netPay = Number(
+        detectValue(row, ["net_pay", "net_salary", "6net_pay", "netpay"]) || 0
+      );
+
+      await prisma.$executeRaw`
+        INSERT INTO payslip_customers
+        (ippis_number, account_number, bank_name, organisation, salary, net_pay, upload_month, raw_data)
+        VALUES
+        (${ippis}, ${accountNumber}, ${bankName}, ${organisation}, ${salary}, ${netPay}, ${uploadMonth}, ${JSON.stringify(row)}::jsonb)
+        ON CONFLICT (ippis_number, account_number)
+        DO NOTHING;
+      `;
+    }
+
+    await prisma.PayslipUpload.create({
+      data: {
+        upload_month: uploadMonth,
+        uploaded_by: req.user?.email || "system",
+        status: "SUCCESS",
+        record_count: rows.length
+      }
+    });
+
+    safeProgress(uploadId, {
+      success: true,
+      progress: 100,
+      status: "completed",
+      message: "Payslip upload completed"
+    });
+
+    return res.json({
+      success: true,
+      message: "Payslip uploaded successfully",
+      uploadId
+    });
+  } catch (err) {
+    console.error("UPLOAD ERROR:", err);
+
+    safeProgress(uploadId, {
+      success: false,
+      progress: 0,
+      status: "failed",
+      message: err.message
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  } finally {
+    if (req.file?.path) fs.unlink(req.file.path, () => {});
+  }
+};
+
+/* =====================================================
+   ANALYZE PAYROLL
+===================================================== */
+exports.analyzePayrollEligibility = async (req, res) => {
+  const { accountNumber } = req.params;
+
+  const customer = await prisma.payslipCustomer.findFirst({
+    where: { account_number: accountNumber },
+    orderBy: { upload_month: "desc" }
+  });
+
+  if (!customer) return res.json({ success: false });
+
+  const setting = await prisma.app_settings.findFirst({
+    where: { setting_key: "minimum_netpay" }
+  });
+
+  const min = Number(setting?.setting_value || 0);
+
+  return res.json({
+    success: true,
+    eligible: customer.net_pay >= min
+  });
+};
+
+/* =====================================================
+   PUBLIC CHECK
+===================================================== */
+exports.publicPayrollEligibility = async (req, res) => {
+  const customer = await prisma.payslipCustomer.findFirst({
+    where: { account_number: req.params.accountNumber },
+    orderBy: { upload_month: "desc" }
+  });
+
+  return res.json({ success: !!customer });
+};
+
+/* =====================================================
+   CHECK LOAN ELIGIBILITY
+===================================================== */
+exports.checkLoanEligibility = async (req, res) => {
+  const { accountNumber } = req.body;
+
+  const customer = await prisma.payslipCustomer.findFirst({
+    where: { account_number: accountNumber },
+    orderBy: { upload_month: "desc" }
+  });
+
+  if (!customer) return res.json({ success: false });
+
+  const setting = await prisma.app_settings.findFirst({
+    where: { setting_key: "minimum_netpay" }
+  });
+
+  return res.json({
+    success: true,
+    eligible: customer.net_pay >= Number(setting?.setting_value || 0)
+  });
+};
+
+/* =====================================================
+   VERIFY ACCOUNT
+===================================================== */
+exports.verifyLoanAccount = async (req, res) => {
+  const { accountNumber, bankCode, productCode } = req.body;
+
+  try {
+    const bankRes = await axios.post(
+      `${process.env.API_BASE_URL}/api/bank/verify-account`,
+      { accountNumber, bankCode }
+    );
+
+    if (!bankRes.data.success) {
+      return res.json({
+        success: false,
+        message: "Invalid account number or wrong bank selected"
+      });
+    }
+
+    const systemSettings = await prisma.system_settings.findFirst();
+    const loanSettings = systemSettings?.loan_settings || {};
+
+    const productConfig =
+      loanSettings.productApprovals?.[productCode] || {};
+    const requirePayslipCheck =
+      productConfig.requirePayslipCheck === true;
+
+    let customer = null;
+
+    if (requirePayslipCheck) {
+      customer = await prisma.payslipCustomer.findFirst({
+        where: { account_number: accountNumber },
+        orderBy: { upload_month: "desc" }
+      });
+
+      if (!customer) {
+        return res.json({
+          success: false,
+          message: "Salary account not found in payroll"
+        });
+      }
+
+      const setting = await prisma.app_settings.findFirst({
+        where: { setting_key: "minimum_netpay" }
+      });
+
+      const minimumNetPay = Number(setting?.setting_value || 0);
+      const netPay = Number(customer.net_pay || 0);
+
+      if (netPay < minimumNetPay) {
+        return res.json({
+          success: false,
+          message: "Salary does not meet minimum requirement"
+        });
+      }
+
+      return res.json({
+        success: true,
+        eligible: true,
+        accountName: bankRes.data.accountName,
+        bankCode,
+        netPay,
+        minimumRequired: minimumNetPay
+      });
+    }
+
+    return res.json({
+      success: true,
+      eligible: true,
+      accountName: bankRes.data.accountName,
+      bankCode
+    });
+  } catch (err) {
+    console.error("Verification error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Verification failed"
+    });
+  }
+};
+
+/* =====================================================
+   ADMIN FETCH
+===================================================== */
+exports.getAdminPayslipCustomer = async (req, res) => {
+  try {
+    const accountNumber = String(req.params.accountNumber);
+
+    console.log("Fetching payslip for:", accountNumber);
+    console.time("payslip-query");
+
+    const data = await prisma.payslipCustomer.findMany({
+      where: { account_number: accountNumber },
+      orderBy: { upload_month: "desc" },
+      take: 12
+    });
+
+    console.timeEnd("payslip-query");
+
+    if (!data || data.length === 0) {
+      return res.json({
+        success: false,
+        message: "No payroll data found",
+        customer: null,
+        history: []
+      });
+    }
+
+    return res.json({
+      success: true,
+      customer: {
+        ...data[0],
+        organization: data[0].organisation || "N/A"
+      },
+      history: data.map((item) => ({
+        ...item,
+        organization: item.organisation || "N/A"
+      }))
+    });
+  } catch (err) {
+    console.error("Payslip fetch error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch payslip"
+    });
+  }
+};
+
+/* =====================================================
+   GET UPLOAD PROGRESS
+===================================================== */
+exports.getUploadProgress = (req, res) => {
+  const { uploadId } = req.params;
+
+  try {
+    const progress = getProgress(uploadId);
+
+    if (!progress) {
+      return res.status(404).json({
+        success: false,
+        message: "No progress found"
+      });
+    }
+
+    return res.json(progress);
+  } catch (err) {
+    console.error("Progress error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  }
+};

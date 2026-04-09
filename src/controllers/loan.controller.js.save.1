@@ -1,0 +1,913 @@
+const LoanService = require("../core/loan.service");
+const pool = require("../../db"); // adjust path to your db file
+const { notifyLoanUpdate } = require("../utils/loanNotifier");
+
+/* ===============================
+   CREATE LOAN
+================================ */
+exports.createLoan = async (req, res) => {
+  try {
+   const result = await LoanService.createLoanApplication(req.body);
+
+return res.status(201).json({
+  success: true,
+  message: result.message,
+  data: result,
+});
+
+  } catch (err) {
+  return res.status(400).json({
+    success: false,
+    message: err.message,
+  });
+}
+
+};
+
+/* ===============================
+   GET LOANS BY CUSTOMER
+================================ */
+exports.getLoansByCustomer = async (req, res) => {
+  try {
+    const result =
+      await LoanService.getLoansByCustomerId(req.params.customerId);
+
+    return res.json({
+      success: true,
+      data: result.data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch loans",
+      error: err?.response?.data || err.message,
+    });
+  }
+};
+
+/* ===============================
+   REPAYMENT SCHEDULE
+================================ */
+exports.getRepaymentSchedule = async (req, res) => {
+  try {
+    const result =
+      await LoanService.getRepaymentSchedule(
+        req.params.loanAccountNumber
+      );
+
+    return res.json({
+      success: true,
+      data: result.data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch repayment schedule",
+      error: err?.response?.data || err.message,
+    });
+  }
+};
+
+/* ===============================
+   LOAN ACCOUNT BALANCE
+================================ */
+exports.getLoanBalance = async (req, res) => {
+  try {
+    const result =
+      await LoanService.getLoanBalance(
+        req.params.customerId   // ✅ FIXED
+      );
+
+    return res.json({
+      success: true,
+      data: result.data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch loan balance",
+      error: err?.response?.data || err.message,
+    });
+  }
+};
+
+
+
+/* ===============================
+   LOAN ACCOUNT STATEMENT
+================================ */
+exports.getLoanStatement = async (req, res) => {
+  try {
+    const { accountNumber, fromDate, toDate } = req.query; // ✅ FIXED
+
+    const result =
+      await LoanService.getLoanStatement(
+        accountNumber,
+        fromDate,
+        toDate
+      );
+
+    return res.json({
+      success: true,
+      data: result.data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch loan statement",
+      error: err?.response?.data || err.message,
+    });
+  }
+};
+
+/* ===============================
+   REPAY LOAN
+================================ */
+exports.repayLoan = async (req, res) => {
+  try {
+    const result = await LoanService.repayLoan(req.body);
+
+    return res.json({
+      success: true,
+      message: "Loan repayment successful",
+      data: result.data,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Loan repayment failed",
+      error: err?.response?.data || err.message,
+    });
+  }
+};
+
+/* ===============================
+   GET PENDING LOAN APPROVALS
+================================ */
+exports.getPendingLoanApprovals = async (req, res) => {
+
+  try {
+
+    const result =
+      await LoanService.getPendingLoanApprovals(req.user.role_id);
+
+    return res.json({
+      success: true,
+      data: result?.data ?? result ?? [],
+    });
+
+  } catch (err) {
+
+    console.error("APPROVAL FETCH ERROR:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch pending loan approvals",
+      error: err.message,
+    });
+
+  }
+
+};
+
+
+
+
+/* ===============================
+   REJECT LOAN
+================================ */
+exports.rejectLoan = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+    const { reason } = req.body;
+
+    // Optional: keep debug if needed
+    console.log("FILES RECEIVED:", req.files);
+    console.log("BODY:", req.body);
+
+    if (!reason?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Reason is required",
+      });
+    }
+
+    const approverId = req.user.id;
+    const io = req.app.get("io");
+
+    /* ===============================
+       1️⃣ REJECT VIA SERVICE
+    =============================== */
+    await LoanService.rejectLoan({
+      loanId,
+      approverId,
+      reason,
+      files: req.files || [],
+    });
+
+    /* ===============================
+       2️⃣ FETCH FULL LOAN + RM INFO
+    =============================== */
+    const rmRes = await pool.query(
+      `
+      SELECT 
+        u.id,
+        u.email,
+        u.first_name,
+        u.last_name,
+        u.push_subscription, 
+        l.loan_code,
+        l.product_code,
+        l.amount,
+        l.tenor,
+        l.interest_rate,
+        l.monthly_repayment,
+        l.current_stage,
+        l.status,
+        CONCAT(ls.first_name,' ',ls.last_name) AS customer_name
+      FROM loans l
+      JOIN users u ON u.id = l.crm_staff_id
+      JOIN loan_sessions ls ON ls.id = l.session_id
+      WHERE l.id = $1
+      `,
+      [loanId]
+    );
+
+    /* ===============================
+       3️⃣ SEND NOTIFICATION
+    =============================== */
+  if (rmRes.rows.length) {
+  const rm = rmRes.rows[0];
+  const webpush = req.app.get("webpush");   // ✅ ADD THIS
+
+  await notifyLoanUpdate({
+    io,
+    webpush,                                 // ✅ ADD THIS
+    pushSubscription: rm.push_subscription,  // ✅ ADD THIS
+    userId: rm.id,
+    email: rm.email,
+    staffName: rm.first_name,
+
+    loanCode: rm.loan_code,
+    customerName: rm.customer_name,
+    loanType: rm.product_code,
+    amount: rm.amount,
+    tenor: rm.tenor,
+    interestRate: rm.interest_rate,
+    monthlyRepayment: rm.monthly_repayment,
+    stage: rm.current_stage,
+
+    status: "REJECTED",
+    message: reason,
+
+    updatedBy:
+      `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim()
+      || "System"
+  });
+}
+
+    /* ===============================
+       4️⃣ RESPONSE
+    =============================== */
+    return res.json({
+      success: true,
+      message: "Loan rejected successfully",
+    });
+
+  } catch (err) {
+    console.error("REJECT LOAN ERROR:", err);
+
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+
+
+
+
+/* ===============================
+   APPROVE LOAN (ADMIN)
+================================ */
+
+exports.approveLoan = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+    const approverId = req.user.id;
+
+    const {
+      approved_amount,
+      approved_tenor,
+      approved_interest_rate
+    } = req.body;
+if (
+  approved_amount ||
+  approved_tenor ||
+  approved_interest_rate
+) {
+  await pool.query(
+    `
+    UPDATE loans
+    SET
+      approved_amount = COALESCE($1, approved_amount),
+      approved_tenor = COALESCE($2, approved_tenor),
+      approved_interest_rate = COALESCE($3, approved_interest_rate),
+      approved_at = NOW()
+    WHERE id = $4
+    `,
+    [
+      approved_amount || null,
+      approved_tenor || null,
+      approved_interest_rate || null,
+      loanId
+    ]
+  );
+}
+    const io = req.app.get("io");
+
+    /* ===============================
+       1️⃣ APPROVE VIA SERVICE
+    =============================== */
+    
+
+    /* ===============================
+       2️⃣ FETCH FULL LOAN + RM INFO
+    =============================== */
+    const rmRes = await pool.query(
+      `
+      SELECT 
+        u.id,
+        u.email,
+        u.first_name,                 -- ✅ staff first name
+        u.last_name,
+        u.push_subscription, 
+        l.loan_code,
+        l.product_code,
+        l.amount,
+        l.tenor,
+        l.interest_rate,
+        l.monthly_repayment,
+        l.current_stage,
+        l.status,
+        CONCAT(ls.first_name,' ',ls.last_name) AS customer_name
+      FROM loans l
+      JOIN users u ON u.id = l.crm_staff_id
+      JOIN loan_sessions ls ON ls.id = l.session_id
+      WHERE l.id = $1
+      `,
+      [loanId]
+    );
+
+    /* ===============================
+       3️⃣ SEND NOTIFICATION
+    =============================== */
+   /* ===============================
+   3️⃣ SEND NOTIFICATION
+================================ */
+if (rmRes.rows.length) {
+  const rm = rmRes.rows[0];
+  const webpush = req.app.get("webpush");
+
+  await notifyLoanUpdate({
+    io,
+    webpush,
+    pushSubscription: rm.push_subscription, // now valid
+    userId: rm.id,
+    email: rm.email,
+    staffName: rm.first_name,
+
+    loanCode: rm.loan_code,
+    customerName: rm.customer_name,
+    loanType: rm.product_code,
+    amount: rm.amount,
+    tenor: rm.tenor,
+    interestRate: rm.interest_rate,
+    monthlyRepayment: rm.monthly_repayment,
+    stage: rm.current_stage,
+
+    status: result.finalStatus || rm.status || "APPROVED",
+
+    message:
+      result.message ||
+      "The loan has been successfully approved and moved to the next stage.",
+
+    updatedBy:
+      `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim()
+      || "System"
+  });
+}
+
+    /* ===============================
+       4️⃣ RESPONSE
+    =============================== */
+    return res.json(result);
+
+  } catch (err) {
+    console.error("APPROVE LOAN ERROR:", err);
+
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+/* ===============================
+   RETURN LOAN
+================================ */
+exports.returnLoan = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+    const { reason } = req.body;
+
+    if (!reason?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Reason is required",
+      });
+    }
+
+    const approverId = req.user.id;
+    const io = req.app.get("io");
+
+    /* ===============================
+       1️⃣ RETURN VIA SERVICE
+    =============================== */
+    await LoanService.returnLoan({
+      loanId,
+      approverId,
+      reason,
+      files: req.files || [],
+    });
+
+    /* ===============================
+       2️⃣ FETCH FULL LOAN + RM INFO
+    =============================== */
+    const rmRes = await pool.query(
+      `
+      SELECT 
+        u.id,
+        u.email,
+        u.first_name,
+        u.last_name,
+        u.push_subscription, 
+        l.loan_code,
+        l.product_code,
+        l.amount,
+        l.tenor,
+        l.interest_rate,
+        l.monthly_repayment,
+        l.current_stage,
+        l.status,
+        CONCAT(ls.first_name,' ',ls.last_name) AS customer_name
+      FROM loans l
+      JOIN users u ON u.id = l.crm_staff_id
+      JOIN loan_sessions ls ON ls.id = l.session_id
+      WHERE l.id = $1
+      `,
+      [loanId]
+    );
+
+    /* ===============================
+       3️⃣ SEND NOTIFICATION
+    =============================== */
+   if (rmRes.rows.length) {
+  const rm = rmRes.rows[0];
+  const webpush = req.app.get("webpush");   // ✅ ADD THIS
+
+  await notifyLoanUpdate({
+    io,
+    webpush,                                 // ✅ ADD THIS
+    pushSubscription: rm.push_subscription,  // ✅ ADD THIS
+    userId: rm.id,
+    email: rm.email,
+    staffName: rm.first_name,
+
+    loanCode: rm.loan_code,
+    customerName: rm.customer_name,
+    loanType: rm.loan_type,
+    amount: rm.amount,
+    tenor: rm.tenor,
+    interestRate: rm.interest_rate,
+    monthlyRepayment: rm.monthly_repayment,
+    stage: rm.current_stage,
+
+    status: "RETURNED",
+    message: reason,
+
+    updatedBy:
+      `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim()
+      || "System"
+  });
+}
+    /* ===============================
+       4️⃣ RESPONSE
+    =============================== */
+    return res.json({
+      success: true,
+      message: "Loan returned for correction",
+    });
+
+  } catch (err) {
+    console.error("RETURN LOAN ERROR:", err);
+
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+/* ===============================
+   PREVIEW CORE LOAN PAYLOAD
+================================ */
+exports.previewCoreLoanPayload = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+
+    const payload =
+      await LoanService.previewCoreLoanPayload(loanId);
+
+    return res.json({
+      success: true,
+      data: payload,
+    });
+  } catch (err) {
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+exports.createLoanInCore = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+
+    const result =
+      await LoanService.createLoanInCoreBanking(loanId);
+
+    return res.json({
+      success: true,
+      message: "Loan created successfully in core banking",
+      data: result,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Core banking loan creation failed",
+      error: err.message,
+    });
+  }
+};
+
+/* ===============================
+   FULL LOAN LIFECYCLE (APPROVE + CORE + DISBURSE + TRANSFER)
+================================ */
+exports.processLoanLifecycle = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+    const approverId = req.user.id;
+
+    // 🔥 GET EDITABLE PRODUCT VALUES FROM FRONTEND
+    const {
+      interest_rate,
+      tenor,
+      moratorium,
+      computation_mode
+    } = req.body;
+
+    // Optional: basic validation
+    if (interest_rate && Number(interest_rate) < 0) {
+      throw new Error("Invalid interest rate");
+    }
+
+    const overrides = {};
+
+if (interest_rate !== undefined)
+  overrides.interest_rate = Number(interest_rate);
+
+if (tenor !== undefined)
+  overrides.tenor = Number(tenor);
+
+if (moratorium !== undefined)
+  overrides.moratorium = Number(moratorium);
+
+if (computation_mode !== undefined)
+  overrides.computation_mode = computation_mode;
+
+
+    // 🔥 PASS overrides TO SERVICE
+    const result =
+      await LoanService.processLoanLifecycle(
+        loanId,
+        approverId,
+        overrides
+      );
+
+    return res.json(result);
+
+  } catch (err) {
+    console.error("PROCESS LIFECYCLE ERROR:", err);
+
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+
+
+
+// loanController.js (or wherever you handle loan-related actions)
+
+
+exports.validateSalaryAccount = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+
+    const result = await LoanService.validateSalaryAccount(loanId);
+
+    return res.json(result);
+
+  } catch (err) {
+
+    // 🔥 FULL ERROR LOG
+    console.error("❌ Salary Validation Error:", {
+      message: err.message,
+      stack: err.stack,
+      response: err.response?.data || null,
+      loanId: req.params.loanId
+    });
+
+    return res.status(400).json({
+      success: false,
+      message: err.message || "Salary validation failed"
+    });
+  }
+};
+
+
+/* ===============================
+   GET SINGLE LOAN BY ID
+================================ */
+/* ===============================
+   GET SINGLE LOAN BY ID
+================================ */
+exports.getLoanById = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT 
+        l.*,
+        la.answers AS application_payload,
+
+        -- ================= SESSION DATA =================
+        ls.first_name,
+        ls.last_name,
+        ls.bvn,
+        ls.bvn_nin,
+        ls.date_of_birth,
+        ls.core_customer_id,
+        ls.verification_payload,
+
+        -- ================= PRODUCT NAME =================
+        ss.loan_settings->'productMeta'->(l.product_code)::text->>'name'
+          AS product_name,
+
+        -- ================= APPROVAL HISTORY =================
+        COALESCE(ah.approval_history, '[]') AS approval_history
+
+      FROM loans l
+      LEFT JOIN loan_answers la ON la.loan_id = l.id
+      LEFT JOIN loan_sessions ls ON ls.id = l.session_id
+      LEFT JOIN system_settings ss ON TRUE
+
+      LEFT JOIN (
+        SELECT 
+          la.loan_id,
+          json_agg(
+            json_build_object(
+              'approver_id', la.approver_id,
+              'performed_by_name', CONCAT(
+                INITCAP(u.first_name), 
+                ' ', 
+                INITCAP(u.last_name)
+              ),
+              'approval_level', la.approval_level,
+              'action_type', la.approval_status,
+              'reason', la.approval_reason,
+              'created_at', la.created_at,
+              'files', COALESCE((
+                SELECT json_agg(
+                  json_build_object(
+                    'file_name', laf.file_name,
+                    'file_path', laf.file_path
+                  )
+                )
+                FROM loan_approval_files laf
+                WHERE laf.approval_id = la.id
+              ), '[]'::json)
+            )
+            ORDER BY la.approval_level ASC
+          ) AS approval_history
+        FROM loan_approvals la
+        LEFT JOIN users u ON u.id = la.approver_id
+        GROUP BY la.loan_id
+      ) ah ON ah.loan_id = l.id
+
+      WHERE l.id = $1
+      `,
+      [loanId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Loan not found",
+      });
+    }
+
+    const loan = result.rows[0];
+
+    // 🔥 Normalize verification payload
+    const verification =
+      typeof loan.verification_payload === "string"
+        ? JSON.parse(loan.verification_payload)
+        : loan.verification_payload || {};
+
+    return res.json({
+      success: true,
+      data: {
+        ...loan,
+        verification_payload: verification
+      },
+    });
+
+  } catch (err) {
+    console.error("GET LOAN ERROR:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch loan",
+    });
+  }
+};
+
+
+
+
+
+/* ===============================
+   CHECK CORE CUSTOMER BY LOAN ID
+================================ */
+exports.checkCoreCustomerByLoanId = async (req, res) => {
+  try {
+    const { loanId } = req.params;
+
+    const result =
+      await LoanService.checkCoreCustomerByLoanId(loanId);
+
+    return res.json({
+      success: true,
+      ...result, // keep frontend structure clean
+    });
+
+  } catch (err) {
+    console.error("CORE CHECK ERROR:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+
+
+exports.openAccountForCustomer = async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    const result =
+      await LoanService.createAccountForCustomer(customerId);
+
+    return res.json({
+      success: true,
+      data: result,
+    });
+
+  } catch (err) {
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+};
+
+
+/* ===============================
+   GET MY LOAN REQUESTS (RM)
+================================ */
+exports.getMyLoanRequests = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await LoanService.getLoansByRmId(userId);
+
+    return res.json(result);
+
+  } catch (err) {
+    console.error("MY REQUESTS ERROR:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch loan requests",
+    });
+  }
+};
+
+
+/* ===============================
+   GET LOAN TRANSFERS (FILTERABLE)
+================================ */
+exports.getLoanTransfers = async (req, res) => {
+  try {
+    const {
+      status,
+      manualFunding,
+      fromDate,
+      toDate
+    } = req.query;
+
+    const result =
+      await LoanService.getLoanTransfers({
+        status: status || null,
+        manualFunding: manualFunding === "true",
+        fromDate: fromDate || null,
+        toDate: toDate || null
+      });
+
+    return res.json(result);
+
+  } catch (err) {
+    console.error("TRANSFER FETCH ERROR:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  }
+};
+
+
+exports.getOperationalLoans = async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        l.id,
+        l.loan_code,
+        l.product_code,
+        l.amount,
+        l.status,
+        l.disbursement_status,
+        l.created_at,
+
+        CONCAT(ls.first_name,' ',ls.last_name) AS customer_name,
+
+        CASE
+          WHEN l.disbursement_status = 'COMPLETED'
+          THEN true
+          ELSE false
+        END AS disbursed
+
+      FROM loans l
+
+      LEFT JOIN loan_sessions ls
+        ON ls.id = l.session_id
+
+      WHERE l.status = 'APPROVED'
+
+      ORDER BY l.created_at DESC
+    `);
+
+    return res.json({
+      success: true,
+      data: result.rows
+    });
+
+  } catch (err) {
+
+    console.error("OPERATIONS FETCH ERROR:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch operational loans"
+    });
+
+  }
+};
